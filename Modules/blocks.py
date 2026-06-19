@@ -139,7 +139,32 @@ class C3k2(C2f):
             for _ in range(n)
         )
 
-a = C3k2(in_channels=2, out_channel= 4 , n = 2, g=1, shortcut=True)
+class SPPF(nn.Module):
+    def __init__(self, in_channel: int, out_channel: int, k: int = 5, n: int = 3, shortcut: bool = True):
+        """Initialize the SPPF layer with given input/output channels and kernel size.
+
+        Args:
+            in_channel (int): Input channels.
+            out_channel (int): Output channels.
+            k (int): Kernel size.
+            n (int): Number of pooling iterations.
+            shortcut (bool): Whether to use shortcut connection.
+        """
+        super().__init__()
+
+        c_ = in_channel // 2  # hidden channels
+        self.cv1 = Conv(in_channel, c_, 1, 1)
+        self.cv2 = Conv(c_ * (n + 1), out_channel, 1, 1)
+        self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+        self.n = n
+        self.add = shortcut and in_channel == out_channel
+    
+    def forward(self, x):
+        y = [self.cv1(x)]
+        y.extend(self.m(y[-1]) for _ in range(self.n))
+        res = self.cv2(torch.cat(y, 1))
+        return x + res if self.add else res
+
 
 
         
