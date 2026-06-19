@@ -1,3 +1,4 @@
+from torch import autograd
 import torch
 import torch.nn as nn
 
@@ -30,7 +31,7 @@ class Conv(nn.Module):
         self.bn = nn.BatchNorm2d(out_channel)
         self.act = self.def_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
 
-    def foward(self, x):
+    def forward(self, x):
         return self.act(self.bn(self.cv(x)))
 
 class BottleNeck(nn.Module):
@@ -51,21 +52,21 @@ class C2f(nn.Module):
         """Initialize a CSP bottleneck with 2 convolutions.
 
         Args:
-            c1 (int): Input channels.
-            c2 (int): Output channels.
+            in_channel (int): Input channels.
+            out_channel (int): Output channels.
             n (int): Number of Bottleneck blocks.
             shortcut (bool): Whether to use shortcut connections.
             g (int): Groups for convolutions.
             e (float): Expansion ratio.
         """
-        c_ = int(in_channel * e)
-        self.cv1 = Conv(in_channel, c_, k = 1, s = 1)
-        self.cv2 = Conv(c_, out_channel, k = 1, s = 1)
-        self.m = nn.ModuleList(BottleNeck(c_, c_, shortcut, k = (3, 3), e = 0.5) for _ in range(n))
+        super().__init__()
+        self.c = int(out_channel * e)
+        self.cv1 = Conv(in_channel, 2 * self.c, k = 1, s = 1)
+        self.cv2 = Conv((2 + n) * self.c, out_channel, k = 1, s = 1)
+        self.m = nn.ModuleList(BottleNeck(self.c, self.c, shortcut, k = (3, 3), e = 1.0) for _ in range(n))
     
     def forward(self, x):
-        x = self.cv1(x)
-        y = list(x.chunk(2, 1))
+        y = list(self.cv1(x).chunk(2, 1))
         y.extend( m(y[-1]) for m in self.m )
         return self.cv2( torch.cat(y, 1) )
 
@@ -113,14 +114,14 @@ class C3k(C3):
         c_ = int(c2 * e)  # hidden channels
         self.m = nn.Sequential(*(BottleNeck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)))
 
-class C3k2(nn.Module):
-    def __init__(self, in_channels : int, out_channel : int, n : int = 1, C3k : bool = True, e : float = 0.5, attn : bool = False, g : int = 1, shortcut : bool = True):
+class C3k2(C2f):
+    def __init__(self, in_channels : int, out_channel : int, n : int = 1, c3k : bool = True, e : float = 0.5, attn : bool = False, g : int = 1, shortcut : bool = True):
         
         """Initialize C3k2 module.
 
         Args:
-            c1 (int): Input channels.
-            c2 (int): Output channels.
+            in_channels (int): Input channels.
+            out_channel (int): Output channels.
             n (int): Number of blocks.
             c3k (bool): Whether to use C3k blocks.
             e (float): Expansion ratio.
@@ -129,5 +130,17 @@ class C3k2(nn.Module):
             shortcut (bool): Whether to use shortcut connections.
         """
         super().__init__(in_channels, out_channel, n = n, g = g, e = e, shortcut = shortcut)
+
+        # CHƯA CÀI ATTENTION CHO C3K2 Block
+        self.m = nn.ModuleList(
+            C3k(self.c, self.c, 2, shortcut, g)
+            if c3k
+            else BottleNeck(self.c, self.c, shortcut, g)
+            for _ in range(n)
+        )
+
+a = C3k2(in_channels=2, out_channel= 4 , n = 2, g=1, shortcut=True)
+
+
         
 
