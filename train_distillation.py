@@ -1,10 +1,20 @@
 import os
 import sys
+import glob
 import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
+try:
+    import torchvision.transforms as T
+except ImportError:
+    T = None
 
 try:
     from tqdm import tqdm
@@ -39,7 +49,42 @@ class TeacherDetectHook:
     def close(self):
         self.hook.remove()
 
-# --- 2. Dummy Dataset for testing setup ---
+# --- 2. Real COCO Image Dataset Loader ---
+class RealImageDataset(Dataset):
+    """Dataset to load real COCO images from folder for distillation (unsupervised)."""
+    def __init__(self, img_dir, img_size=640):
+        self.img_paths = []
+        for ext in ["*.jpg", "*.jpeg", "*.png"]:
+            self.img_paths.extend(glob.glob(os.path.join(img_dir, ext)))
+            self.img_paths.extend(glob.glob(os.path.join(img_dir, ext.upper())))
+            
+        self.img_size = img_size
+        if T is not None:
+            self.transform = T.Compose([
+                T.Resize((img_size, img_size)),
+                T.ToTensor(),
+            ])
+        else:
+            self.transform = None
+
+    def __len__(self):
+        return len(self.img_paths)
+
+    def __getitem__(self, index):
+        img_path = self.img_paths[index]
+        try:
+            img = Image.open(img_path).convert("RGB")
+            if self.transform is not None:
+                img = self.transform(img)
+            else:
+                # Basic fallback if torchvision is missing
+                img = torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0
+            return img
+        except Exception as e:
+            # Fallback to the first image if reading fails
+            return self.__getitem__(0)
+
+# --- 3. Dummy Dataset for fallback/testing ---
 class DummyCOCODataset(Dataset):
     def __init__(self, size=64):
         self.size = size
@@ -58,6 +103,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=2, help="Batch size for training")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--data-dir", type=str, default="/content/coco/train2017", help="Path to COCO train2017 directory")
     args = parser.parse_args()
 
     print("=== Preparing Google Colab Distillation setup for YOLO26 ===")
@@ -124,12 +170,24 @@ def main():
     )
 
     # --- 7. DataLoader Setup ---
-    # Replace DummyCOCODataset with your actual COCO dataset loader during training.
-    train_dataset = DummyCOCODataset(size=8)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    # Attempt to load real COCO dataset from --data-dir, fallback to Dummy if not found
+    if os.path.exists(args.data_dir) and len(glob.glob(os.path.join(args.data_dir, "*"))):
+        print(f"Loading real COCO images from: {args.data_dir}")
+        train_dataset = RealImageDataset(img_dir=args.data_dir, img_size=640)
+    else:
+        print(f"Warning: COCO data directory not found or empty at '{args.data_dir}'. Using dummy dataset instead.")
+        train_dataset = DummyCOCODataset(size=8)
+        
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=True, 
+        num_workers=4 if os.path.exists(args.data_dir) else 0,
+        pin_memory=True if device.type == "cuda" else False
+    )
 
     # --- 8. Distillation Training Loop ---
-    print(f"\nRunning training loop for {args.epochs} epochs...")
+    print(f"\nRunning training loop for {args.epochs} epochs with {len(train_loader)} steps/epoch...")
     student.train()
     
     for epoch in range(args.epochs):
