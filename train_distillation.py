@@ -130,7 +130,7 @@ def main():
         from ultralytics import YOLO
         # Load pre-trained weights.
         # This will download the file 'yolo26l.pt' if it does not exist.
-        teacher_wrapper = YOLO("yolo26l.pt")
+        teacher_wrapper = YOLO("yolo26m.pt")
         teacher = teacher_wrapper.model.to(device)  # Access the underlying nn.Module
         print("Teacher successfully loaded from global Ultralytics package!")
     except ImportError:
