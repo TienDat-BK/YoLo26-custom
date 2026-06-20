@@ -48,7 +48,7 @@ class YOLO26DistillationLoss(nn.Module):
             t_boxes = teacher_outputs[branch]["boxes"]  # Teacher raw boxes
             
             # L1 Loss directly on the coordinate logits
-            loss_bbox += F.l1_loss(s_boxes, t_boxes)
+            loss_bbox += F.mse_loss(s_boxes, t_boxes)
 
         return {
             "loss_feat": loss_feat,

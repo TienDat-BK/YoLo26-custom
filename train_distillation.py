@@ -104,6 +104,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=2, help="Batch size for training")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--data-dir", type=str, default="/content/lfw", help="Path to LFW or COCO images directory")
+    parser.add_argument("--weight", type=str, default="", help="path to load pretrain weight" )
     args = parser.parse_args()
 
     print("=== Preparing Google Colab Distillation setup for YOLO26 ===")
@@ -116,6 +117,11 @@ def main():
     nc = 80  # COCO dataset classes
     print("\nInitializing Student Model (YOLO26 Custom Nano)...")
     student = yolo26n_custom(nc=nc, end2end=True).to(device)
+    if args.weight != "":
+        weight_path = args.weight
+        state_dict = torch.load(weight_path)
+        student.load_state_dict(state_dict)
+        print(f"Model load preTrain weight : {weight_path}")
     print("Student successfully loaded!")
 
     # --- 4. Instantiate Teacher Model ---
@@ -220,7 +226,7 @@ def main():
             loss_cls = losses["loss_cls"]
             loss_bbox = losses["loss_bbox"]
             
-            total_loss = 1.0 * loss_feat + 2.0 * loss_cls + 1.5 * loss_bbox
+            total_loss = 1.0 * loss_feat + 1.0 * loss_cls + 1.5 * loss_bbox
             
             # Backward pass
             optimizer.zero_grad()
