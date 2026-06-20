@@ -54,9 +54,9 @@ class RealImageDataset(Dataset):
     """Dataset to load real COCO images from folder for distillation (unsupervised)."""
     def __init__(self, img_dir, img_size=640):
         self.img_paths = []
-        for ext in ["*.jpg", "*.jpeg", "*.png"]:
-            self.img_paths.extend(glob.glob(os.path.join(img_dir, ext)))
-            self.img_paths.extend(glob.glob(os.path.join(img_dir, ext.upper())))
+        for ext in ["**/*.jpg", "**/*.jpeg", "**/*.png"]:
+            self.img_paths.extend(glob.glob(os.path.join(img_dir, ext), recursive=True))
+            self.img_paths.extend(glob.glob(os.path.join(img_dir, ext.upper()), recursive=True))
             
         self.img_size = img_size
         if T is not None:
@@ -103,7 +103,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=2, help="Batch size for training")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--data-dir", type=str, default="/content/coco/train2017", help="Path to COCO train2017 directory")
+    parser.add_argument("--data-dir", type=str, default="/content/lfw", help="Path to LFW or COCO images directory")
     args = parser.parse_args()
 
     print("=== Preparing Google Colab Distillation setup for YOLO26 ===")
