@@ -258,18 +258,6 @@ class Detect(nn.Module):
 
         return scores[..., None], (index % nc)[..., None].float(), idx
 
-    # ── utilities ─────────────────────────────────────────────────────────────
-
-    def bias_init(self):
-        """Initialize detection head biases (call after stride is set)."""
-        for i, (a, b) in enumerate(zip(self.one2many["box_head"], self.one2many["cls_head"])):
-            a[-1].bias.data[:] = 2.0
-            b[-1].bias.data[:self.nc] = math.log(5 / self.nc / (640 / self.stride[i]) ** 2)
-        if self.end2end:
-            for i, (a, b) in enumerate(zip(self.one2one["box_head"], self.one2one["cls_head"])):
-                a[-1].bias.data[:] = 2.0
-                b[-1].bias.data[:self.nc] = math.log(5 / self.nc / (640 / self.stride[i]) ** 2)
-
     def fuse(self) -> None:
         """Drop the one-to-many head to speed up inference."""
         self.cv2 = self.cv3 = None
