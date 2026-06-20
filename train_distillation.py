@@ -170,12 +170,12 @@ def main():
     )
 
     # --- 7. DataLoader Setup ---
-    # Attempt to load real COCO dataset from --data-dir, fallback to Dummy if not found
+    # Attempt to load real images from --data-dir, fallback to Dummy if not found
     if os.path.exists(args.data_dir) and len(glob.glob(os.path.join(args.data_dir, "*"))):
-        print(f"Loading real COCO images from: {args.data_dir}")
+        print(f"Loading real images from dataset directory: {args.data_dir}")
         train_dataset = RealImageDataset(img_dir=args.data_dir, img_size=640)
     else:
-        print(f"Warning: COCO data directory not found or empty at '{args.data_dir}'. Using dummy dataset instead.")
+        print(f"Warning: Dataset directory not found or empty at '{args.data_dir}'. Using dummy dataset instead.")
         train_dataset = DummyCOCODataset(size=8)
         
     train_loader = DataLoader(
