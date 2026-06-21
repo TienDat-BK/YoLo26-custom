@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 import argparse
 import torch
@@ -54,19 +54,56 @@ class TeacherDetectHook:
 
 
 # ==============================================================================
-# --- 2. FiftyOne COCO Person Dataset ---
+# --- 2. COCO Person Dataset (folder + JSON annotation, no external library) ---
 # ==============================================================================
-class FiftyOnePersonDataset(Dataset):
+class COCOPersonDataset(Dataset):
     """
-    Reads images from a FiftyOne dataset (already filtered to 'person' class).
-    Returns resized tensors ready for model inference.
+    Reads images from a COCO-format folder and filters only images
+    that contain at least one 'person' annotation, using the instances JSON.
+
+    Usage:
+        dataset = COCOPersonDataset(
+            img_dir  = "/content/train2017",
+            ann_file = "/content/annotations/instances_train2017.json",
+            max_samples = 10000,
+            img_size = 640,
+        )
     """
-    def __init__(self, fo_dataset, img_size=640):
-        self.img_paths = [
-            s.filepath for s in fo_dataset
-            if s.filepath and os.path.exists(s.filepath)
-        ]
+    # COCO category_id for 'person' is always 1
+    PERSON_CAT_ID = 1
+
+    def __init__(self, img_dir, ann_file, max_samples=None, img_size=640):
+        import json
+        self.img_dir  = img_dir
         self.img_size = img_size
+
+        print(f"[Dataset] Parsing COCO annotation: {ann_file}")
+        with open(ann_file, "r") as f:
+            coco = json.load(f)
+
+        # Collect image_ids that have at least one person annotation
+        person_img_ids = set(
+            ann["image_id"] for ann in coco["annotations"]
+            if ann["category_id"] == self.PERSON_CAT_ID
+        )
+
+        # Build id → filename map
+        id2file = {img["id"]: img["file_name"] for img in coco["images"]}
+
+        # Filter + build full paths
+        all_paths = [
+            os.path.join(img_dir, id2file[img_id])
+            for img_id in person_img_ids
+            if img_id in id2file
+        ]
+        # Keep only files that actually exist on disk
+        all_paths = [p for p in all_paths if os.path.exists(p)]
+
+        # Optionally cap the number of samples
+        if max_samples is not None:
+            all_paths = all_paths[:max_samples]
+
+        self.img_paths = all_paths
 
         if T is not None:
             self.transform = T.Compose([
@@ -76,7 +113,7 @@ class FiftyOnePersonDataset(Dataset):
         else:
             self.transform = None
 
-        print(f"[Dataset] Found {len(self.img_paths)} valid person images.")
+        print(f"[Dataset] Found {len(self.img_paths)} person images (cap={max_samples}).")
 
     def __len__(self):
         return len(self.img_paths)
@@ -206,9 +243,13 @@ def main():
     parser.add_argument("--lr",          type=float, default=1e-3,
                         help="Learning rate for AdamW")
     parser.add_argument("--max-samples", type=int,   default=10000,
-                        help="Max number of COCO person images to load")
+                        help="Max number of COCO person images to use")
     parser.add_argument("--img-size",    type=int,   default=640,
                         help="Input image resolution")
+    parser.add_argument("--data-dir",    type=str,   default="/content/train2017",
+                        help="Path to COCO images folder (e.g. train2017/)")
+    parser.add_argument("--ann-file",    type=str,   default="/content/annotations/instances_train2017.json",
+                        help="Path to COCO instances annotation JSON")
     parser.add_argument("--weight",      type=str,   default="",
                         help="Path to student pretrain weight (.pt)")
     parser.add_argument("--save-path",   type=str,   default="yolo26n_person_distilled.pt",
@@ -219,27 +260,25 @@ def main():
     print(f"[Init] Using device: {device}")
 
     # ------------------------------------------------------------------
-    # Step A: Load COCO Person dataset via FiftyOne
+    # Step A: Load COCO Person images from folder + instances JSON
     # ------------------------------------------------------------------
-    print("\n[Data] Loading COCO 2017 train — person class only via FiftyOne...")
-    try:
-        import fiftyone.zoo as foz
-        fo_dataset = foz.load_zoo_dataset(
-            "coco-2017",
-            split="train",
-            label_types=["detections"],
-            classes=["person"],
-            max_samples=args.max_samples,
+    print("\n[Data] Loading COCO person images from folder + annotation JSON...")
+    if os.path.isdir(args.data_dir) and os.path.isfile(args.ann_file):
+        raw_dataset = COCOPersonDataset(
+            img_dir     = args.data_dir,
+            ann_file    = args.ann_file,
+            max_samples = args.max_samples,
+            img_size    = args.img_size,
         )
-        print(f"[Data] FiftyOne loaded {len(fo_dataset)} samples.")
-        raw_dataset = FiftyOnePersonDataset(fo_dataset, img_size=args.img_size)
-    except Exception as e:
-        print(f"[Data] FiftyOne failed ({e}). Falling back to dummy dataset.")
+    else:
+        print(f"[Data] WARNING: --data-dir '{args.data_dir}' or "
+              f"--ann-file '{args.ann_file}' not found.")
+        print("[Data] Falling back to dummy dataset for pipeline testing.")
         class _DummyDS(Dataset):
             def __len__(self): return 32
             def __getitem__(self, i): return torch.randn(3, args.img_size, args.img_size)
         raw_dataset = _DummyDS()
-        print(f"[Data] Using dummy dataset ({len(raw_dataset)} synthetic samples).")
+        print(f"[Data] Dummy dataset: {len(raw_dataset)} synthetic samples.")
 
     raw_loader = DataLoader(
         raw_dataset,
