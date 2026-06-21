@@ -129,25 +129,30 @@ class COCOPersonDataset(Dataset):
 
 
 # ==============================================================================
-# --- 3. Cached Teacher Dataset (RAM) ---
+# --- 3. Disk-Cached Teacher Dataset ---
 # ==============================================================================
-class CachedTeacherDataset(Dataset):
+class DiskCachedTeacherDataset(Dataset):
     """
-    Dataset backed by in-RAM teacher cache.
-    Each item is a dict: {'img', 't_preds', 't_feats'}
+    Reads per-sample teacher cache files from disk.
+    Each file is a .pt dict: {'img', 't_preds', 't_feats'} — person-only, CPU tensors.
     """
-    def __init__(self, cache):
-        self.cache = cache
+    def __init__(self, cache_dir):
+        self.files = sorted(
+            os.path.join(cache_dir, f)
+            for f in os.listdir(cache_dir)
+            if f.endswith(".pt")
+        )
+        print(f"[DiskCache] Found {len(self.files)} cached samples in '{cache_dir}'.")
 
     def __len__(self):
-        return len(self.cache)
+        return len(self.files)
 
     def __getitem__(self, index):
-        return self.cache[index]
+        return torch.load(self.files[index], map_location="cpu")
 
 
 def cached_collate_fn(batch):
-    """Custom collate to batch cached teacher outputs."""
+    """Custom collate: stack imgs, cat teacher preds and feats across batch."""
     imgs = torch.stack([item["img"] for item in batch])
     t_preds = {
         "one2many": {
@@ -167,22 +172,26 @@ def cached_collate_fn(batch):
 
 
 # ==============================================================================
-# --- 4. Phase 1: Cache all Teacher outputs in RAM ---
+# --- 4. Phase 1: Cache Teacher outputs to DISK (person-only, per-sample) ---
 # ==============================================================================
-PERSON_CLASS_IDX = 0  # In COCO 80-class order, 'person' is index 0
+PERSON_CLASS_IDX = 0  # COCO 80-class: 'person' is index 0
 
-def cache_teacher_outputs(teacher, teacher_hook, loader, device):
+def cache_teacher_outputs(teacher, teacher_hook, loader, device, cache_dir):
     """
-    Run Teacher on the entire dataset once and store all outputs in RAM.
-    Teacher scores/boxes are sliced to person class only (nc=1) before caching.
+    Run Teacher forward pass once on the entire dataset.
+    Save each sample individually as a .pt file in cache_dir.
+    Teacher scores are sliced to person class only (nc=1) before saving.
 
+    Args:
+        cache_dir (str): Directory to write .pt cache files into.
     Returns:
-        cache (list of dict): keys = 'img', 't_preds', 't_feats' (all on CPU)
+        int: Total number of samples cached.
     """
+    os.makedirs(cache_dir, exist_ok=True)
     teacher.eval()
-    cache = []
+    sample_idx = 0
 
-    print("\n[Phase 1] Running Teacher forward pass to build RAM cache...")
+    print(f"\n[Phase 1] Caching Teacher outputs to disk: '{cache_dir}'")
     pbar = tqdm(loader, desc="[Teacher Cache]")
 
     with torch.no_grad():
@@ -194,26 +203,27 @@ def cache_teacher_outputs(teacher, teacher_hook, loader, device):
             if isinstance(t_preds, tuple):
                 t_preds = t_preds[1]  # raw dict: {'one2many': {...}, 'one2one': {...}}
 
-            # Capture neck features from hook
-            t_feats_gpu = teacher_hook.features  # list of Tensor [B, C, H, W]
+            # Capture Neck features from hook (list of Tensor [B, C, H, W])
+            t_feats_gpu = teacher_hook.features
 
-            # Slice Teacher output to person class only (index 0 → keep as nc=1)
+            # --- Slice to person class only BEFORE moving to CPU ---
             t_preds_person = {}
             for branch in ["one2many", "one2one"]:
                 scores = t_preds[branch]["scores"]  # [B, num_queries, 80]
                 boxes  = t_preds[branch]["boxes"]   # [B, num_queries, 4]
                 t_preds_person[branch] = {
+                    # Keep only person channel → [B, num_queries, 1]
                     "scores": scores[:, :, PERSON_CLASS_IDX : PERSON_CLASS_IDX + 1].cpu(),
                     "boxes":  boxes.cpu(),
                 }
 
-            # Move neck features to CPU
+            # Move Neck features to CPU
             t_feats_cpu = [f.cpu() for f in t_feats_gpu]
 
-            # Store per-sample so DataLoader can batch freely
+            # Save each sample as a separate .pt file
             B = imgs.shape[0]
             for b in range(B):
-                cache.append({
+                sample = {
                     "img": imgs[b].cpu(),
                     "t_preds": {
                         branch: {
@@ -223,10 +233,15 @@ def cache_teacher_outputs(teacher, teacher_hook, loader, device):
                         for branch in ["one2many", "one2one"]
                     },
                     "t_feats": [f[b].unsqueeze(0) for f in t_feats_cpu],
-                })
+                }
+                out_path = os.path.join(cache_dir, f"sample_{sample_idx:06d}.pt")
+                torch.save(sample, out_path)
+                sample_idx += 1
 
-    print(f"[Phase 1] Done. Cached {len(cache)} samples in RAM.")
-    return cache
+            pbar.set_postfix({"saved": sample_idx})
+
+    print(f"[Phase 1] Done. {sample_idx} samples saved to '{cache_dir}'.")
+    return sample_idx
 
 
 # ==============================================================================
@@ -250,6 +265,8 @@ def main():
                         help="Path to COCO images folder (e.g. train2017/)")
     parser.add_argument("--ann-file",    type=str,   default="/content/annotations/instances_train2017.json",
                         help="Path to COCO instances annotation JSON")
+    parser.add_argument("--cache-dir",   type=str,   default="/content/teacher_cache",
+                        help="Directory to write/read per-sample teacher .pt cache files")
     parser.add_argument("--weight",      type=str,   default="",
                         help="Path to student pretrain weight (.pt)")
     parser.add_argument("--save-path",   type=str,   default="yolo26n_person_distilled.pt",
@@ -329,26 +346,39 @@ def main():
     teacher_hook = TeacherDetectHook(detect_module)
 
     # ------------------------------------------------------------------
-    # PHASE 1 — Cache all Teacher outputs in RAM
+    # PHASE 1 — Cache Teacher outputs to DISK (skip if cache already exists)
     # ------------------------------------------------------------------
-    ram_cache = cache_teacher_outputs(teacher, teacher_hook, raw_loader, device)
+    cache_dir = args.cache_dir
+    existing_files = [
+        f for f in os.listdir(cache_dir)
+        if f.endswith(".pt")
+    ] if os.path.isdir(cache_dir) else []
 
-    # Free Teacher from GPU — no longer needed after caching
-    teacher_hook.close()
-    del teacher
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-    print("[Phase 1] Teacher removed from GPU. VRAM freed for student training.")
+    if existing_files:
+        print(f"\n[Phase 1] Cache already exists ({len(existing_files)} files) "
+              f"in '{cache_dir}' — skipping Teacher forward pass.")
+        # Teacher and hook not needed — release immediately
+        teacher_hook.close()
+        del teacher
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    else:
+        cache_teacher_outputs(teacher, teacher_hook, raw_loader, device, cache_dir)
+        teacher_hook.close()
+        del teacher
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        print("[Phase 1] Teacher removed from GPU. VRAM freed for student training.")
 
     # ------------------------------------------------------------------
-    # Build Phase 2 DataLoader from RAM cache
+    # Build Phase 2 DataLoader from DISK cache
     # ------------------------------------------------------------------
-    cached_dataset = CachedTeacherDataset(ram_cache)
+    cached_dataset = DiskCachedTeacherDataset(cache_dir)
     cached_loader  = DataLoader(
         cached_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,          # Data already in RAM — no I/O workers needed
+        num_workers=4,          # Multiple workers to overlap disk I/O with GPU compute
         collate_fn=cached_collate_fn,
     )
 
