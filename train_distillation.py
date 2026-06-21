@@ -1,11 +1,11 @@
-import os
+﻿import os
 import sys
-import glob
 import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
+
 try:
     from PIL import Image
 except ImportError:
@@ -35,30 +35,39 @@ sys.path.insert(0, os.path.abspath("."))
 from Modules.Model import yolo26n_custom
 from Modules.DistillationLoss import YOLO26DistillationLoss
 
-# --- 1. Teacher Feature Hook Setup ---
+
+# ==============================================================================
+# --- 1. Teacher Feature Hook ---
+# ==============================================================================
 class TeacherDetectHook:
-    """Hook to capture intermediate Neck outputs from Teacher Detect head."""
+    """Hook to capture intermediate Neck feature inputs to the Teacher Detect head."""
     def __init__(self, detect_module):
         self.hook = detect_module.register_forward_hook(self.hook_fn)
         self.features = None
 
     def hook_fn(self, module, input, output):
-        # input[0] contains the input features to the Detect head: [p3, p4, p5]
+        # input[0] = list of neck feature maps [p3, p4, p5] fed into Detect head
         self.features = input[0]
 
     def close(self):
         self.hook.remove()
 
-# --- 2. Real COCO Image Dataset Loader ---
-class RealImageDataset(Dataset):
-    """Dataset to load real COCO images from folder for distillation (unsupervised)."""
-    def __init__(self, img_dir, img_size=640):
-        self.img_paths = []
-        for ext in ["**/*.jpg", "**/*.jpeg", "**/*.png"]:
-            self.img_paths.extend(glob.glob(os.path.join(img_dir, ext), recursive=True))
-            self.img_paths.extend(glob.glob(os.path.join(img_dir, ext.upper()), recursive=True))
-            
+
+# ==============================================================================
+# --- 2. FiftyOne COCO Person Dataset ---
+# ==============================================================================
+class FiftyOnePersonDataset(Dataset):
+    """
+    Reads images from a FiftyOne dataset (already filtered to 'person' class).
+    Returns resized tensors ready for model inference.
+    """
+    def __init__(self, fo_dataset, img_size=640):
+        self.img_paths = [
+            s.filepath for s in fo_dataset
+            if s.filepath and os.path.exists(s.filepath)
+        ]
         self.img_size = img_size
+
         if T is not None:
             self.transform = T.Compose([
                 T.Resize((img_size, img_size)),
@@ -67,190 +76,314 @@ class RealImageDataset(Dataset):
         else:
             self.transform = None
 
+        print(f"[Dataset] Found {len(self.img_paths)} valid person images.")
+
     def __len__(self):
         return len(self.img_paths)
 
     def __getitem__(self, index):
-        img_path = self.img_paths[index]
         try:
-            img = Image.open(img_path).convert("RGB")
-            if self.transform is not None:
+            img = Image.open(self.img_paths[index]).convert("RGB")
+            if self.transform:
                 img = self.transform(img)
-            else:
-                # Basic fallback if torchvision is missing
-                img = torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0
             return img
-        except Exception as e:
-            # Fallback to the first image if reading fails
+        except Exception:
             return self.__getitem__(0)
 
-# --- 3. Dummy Dataset for fallback/testing ---
-class DummyCOCODataset(Dataset):
-    def __init__(self, size=64):
-        self.size = size
+
+# ==============================================================================
+# --- 3. Cached Teacher Dataset (RAM) ---
+# ==============================================================================
+class CachedTeacherDataset(Dataset):
+    """
+    Dataset backed by in-RAM teacher cache.
+    Each item is a dict: {'img', 't_preds', 't_feats'}
+    """
+    def __init__(self, cache):
+        self.cache = cache
 
     def __len__(self):
-        return self.size
+        return len(self.cache)
 
     def __getitem__(self, index):
-        # Dummy image of size 640x640
-        x = torch.randn(3, 640, 640)
-        return x
+        return self.cache[index]
 
+
+def cached_collate_fn(batch):
+    """Custom collate to batch cached teacher outputs."""
+    imgs = torch.stack([item["img"] for item in batch])
+    t_preds = {
+        "one2many": {
+            "scores": torch.cat([item["t_preds"]["one2many"]["scores"] for item in batch], dim=0),
+            "boxes":  torch.cat([item["t_preds"]["one2many"]["boxes"]  for item in batch], dim=0),
+        },
+        "one2one": {
+            "scores": torch.cat([item["t_preds"]["one2one"]["scores"]  for item in batch], dim=0),
+            "boxes":  torch.cat([item["t_preds"]["one2one"]["boxes"]   for item in batch], dim=0),
+        },
+    }
+    t_feats = [
+        torch.cat([item["t_feats"][i] for item in batch], dim=0)
+        for i in range(len(batch[0]["t_feats"]))
+    ]
+    return imgs, t_preds, t_feats
+
+
+# ==============================================================================
+# --- 4. Phase 1: Cache all Teacher outputs in RAM ---
+# ==============================================================================
+PERSON_CLASS_IDX = 0  # In COCO 80-class order, 'person' is index 0
+
+def cache_teacher_outputs(teacher, teacher_hook, loader, device):
+    """
+    Run Teacher on the entire dataset once and store all outputs in RAM.
+    Teacher scores/boxes are sliced to person class only (nc=1) before caching.
+
+    Returns:
+        cache (list of dict): keys = 'img', 't_preds', 't_feats' (all on CPU)
+    """
+    teacher.eval()
+    cache = []
+
+    print("\n[Phase 1] Running Teacher forward pass to build RAM cache...")
+    pbar = tqdm(loader, desc="[Teacher Cache]")
+
+    with torch.no_grad():
+        for imgs in pbar:
+            imgs = imgs.to(device)
+
+            t_preds = teacher(imgs)
+            # Ultralytics eval mode may return (postprocessed, raw_preds) tuple
+            if isinstance(t_preds, tuple):
+                t_preds = t_preds[1]  # raw dict: {'one2many': {...}, 'one2one': {...}}
+
+            # Capture neck features from hook
+            t_feats_gpu = teacher_hook.features  # list of Tensor [B, C, H, W]
+
+            # Slice Teacher output to person class only (index 0 → keep as nc=1)
+            t_preds_person = {}
+            for branch in ["one2many", "one2one"]:
+                scores = t_preds[branch]["scores"]  # [B, num_queries, 80]
+                boxes  = t_preds[branch]["boxes"]   # [B, num_queries, 4]
+                t_preds_person[branch] = {
+                    "scores": scores[:, :, PERSON_CLASS_IDX : PERSON_CLASS_IDX + 1].cpu(),
+                    "boxes":  boxes.cpu(),
+                }
+
+            # Move neck features to CPU
+            t_feats_cpu = [f.cpu() for f in t_feats_gpu]
+
+            # Store per-sample so DataLoader can batch freely
+            B = imgs.shape[0]
+            for b in range(B):
+                cache.append({
+                    "img": imgs[b].cpu(),
+                    "t_preds": {
+                        branch: {
+                            "scores": t_preds_person[branch]["scores"][b].unsqueeze(0),
+                            "boxes":  t_preds_person[branch]["boxes"][b].unsqueeze(0),
+                        }
+                        for branch in ["one2many", "one2one"]
+                    },
+                    "t_feats": [f[b].unsqueeze(0) for f in t_feats_cpu],
+                })
+
+    print(f"[Phase 1] Done. Cached {len(cache)} samples in RAM.")
+    return cache
+
+
+# ==============================================================================
+# --- 5. Main ---
+# ==============================================================================
 def main():
-    # --- Parse Arguments ---
-    parser = argparse.ArgumentParser(description="YOLO26 Knowledge Distillation Training Script")
-    parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
-    parser.add_argument("--batch-size", type=int, default=2, help="Batch size for training")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--data-dir", type=str, default="/content/lfw", help="Path to LFW or COCO images directory")
-    parser.add_argument("--weight", type=str, default="", help="path to load pretrain weight" )
+    parser = argparse.ArgumentParser(
+        description="YOLO26 Distillation: COCO Person Only — 2-Phase RAM Cache Strategy"
+    )
+    parser.add_argument("--epochs",      type=int,   default=10,
+                        help="Number of student training epochs (Phase 2)")
+    parser.add_argument("--batch-size",  type=int,   default=4,
+                        help="Batch size for both phases")
+    parser.add_argument("--lr",          type=float, default=1e-3,
+                        help="Learning rate for AdamW")
+    parser.add_argument("--max-samples", type=int,   default=10000,
+                        help="Max number of COCO person images to load")
+    parser.add_argument("--img-size",    type=int,   default=640,
+                        help="Input image resolution")
+    parser.add_argument("--weight",      type=str,   default="",
+                        help="Path to student pretrain weight (.pt)")
+    parser.add_argument("--save-path",   type=str,   default="yolo26n_person_distilled.pt",
+                        help="Output path for distilled student weights")
     args = parser.parse_args()
 
-    print("=== Preparing Google Colab Distillation setup for YOLO26 ===")
-    
-    # Check GPU availability
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    print(f"[Init] Using device: {device}")
 
-    # --- 3. Instantiate Student Model ---
-    nc = 80  # COCO dataset classes
-    print("\nInitializing Student Model (YOLO26 Custom Nano)...")
-    student = yolo26n_custom(nc=nc, end2end=True).to(device)
-    if args.weight != "":
-        weight_path = args.weight
-        state_dict = torch.load(weight_path)
+    # ------------------------------------------------------------------
+    # Step A: Load COCO Person dataset via FiftyOne
+    # ------------------------------------------------------------------
+    print("\n[Data] Loading COCO 2017 train — person class only via FiftyOne...")
+    try:
+        import fiftyone.zoo as foz
+        fo_dataset = foz.load_zoo_dataset(
+            "coco-2017",
+            split="train",
+            label_types=["detections"],
+            classes=["person"],
+            max_samples=args.max_samples,
+        )
+        print(f"[Data] FiftyOne loaded {len(fo_dataset)} samples.")
+        raw_dataset = FiftyOnePersonDataset(fo_dataset, img_size=args.img_size)
+    except Exception as e:
+        print(f"[Data] FiftyOne failed ({e}). Falling back to dummy dataset.")
+        class _DummyDS(Dataset):
+            def __len__(self): return 32
+            def __getitem__(self, i): return torch.randn(3, args.img_size, args.img_size)
+        raw_dataset = _DummyDS()
+        print(f"[Data] Using dummy dataset ({len(raw_dataset)} synthetic samples).")
+
+    raw_loader = DataLoader(
+        raw_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,          # Keep order for deterministic caching
+        num_workers=2,
+        pin_memory=(device.type == "cuda"),
+    )
+
+    # ------------------------------------------------------------------
+    # Step B: Initialize Student Model — nc=1 (person only)
+    # ------------------------------------------------------------------
+    print("\n[Model] Initializing Student (YOLO26 Nano, nc=1 — person only)...")
+    student = yolo26n_custom(nc=1, end2end=True).to(device)
+    if args.weight:
+        state_dict = torch.load(args.weight, map_location=device)
         student.load_state_dict(state_dict)
-        print(f"Model load preTrain weight : {weight_path}")
-    print("Student successfully loaded!")
+        for p in student.backbone.parameters():
+            p.requires_grad = False
+        print(f"[Model] Student loaded pretrain weight: {args.weight}")
+    print("[Model] Student ready.")
 
-    # --- 4. Instantiate Teacher Model ---
-    print("\nLoading Teacher Model (YOLO26 Large from Ultralytics)...")
-    
-    # Force python to import global/pip installed 'ultralytics' instead of local workspace folder
+    # ------------------------------------------------------------------
+    # Step C: Load Teacher Model — nc=80 (full COCO)
+    # ------------------------------------------------------------------
+    print("\n[Model] Loading Teacher (YOLO26m, nc=80) from Ultralytics...")
     saved_paths = list(sys.path)
     try:
         current_dir = os.path.abspath(".")
         sys.path = [p for p in sys.path if p != "" and os.path.abspath(p) != current_dir]
-        
         from ultralytics import YOLO
-        # Load pre-trained weights.
-        # This will download the file 'yolo26l.pt' if it does not exist.
         teacher_wrapper = YOLO("yolo26m.pt")
-        teacher = teacher_wrapper.model.to(device)  # Access the underlying nn.Module
-        print("Teacher successfully loaded from global Ultralytics package!")
+        teacher = teacher_wrapper.model.to(device)
+        print("[Model] Teacher loaded from Ultralytics package.")
     except ImportError:
-        print("Warning: Global 'ultralytics' library not installed.")
-        print("If you are on Google Colab, please run: !pip install ultralytics")
-        print("Mocking Teacher model for local testing...")
-        # Mock teacher using custom class at large scale
+        print("[Model] Ultralytics not found — using mock large YOLO26_Custom as teacher.")
         from Modules.Model import YOLO26_Custom
-        teacher = YOLO26_Custom(nc=nc, end2end=True, w=1.00, d=1.00, mc=512).to(device)
+        teacher = YOLO26_Custom(nc=80, end2end=True, w=1.00, d=1.00, mc=512).to(device)
     finally:
         sys.path = saved_paths
 
-    # Freeze Teacher weights
     for param in teacher.parameters():
         param.requires_grad = False
     teacher.eval()
 
-    # --- 5. Register Hook on Teacher Detect head ---
-    # In Ultralytics models, the last module model.model[-1] is the Detect head.
+    # Register hook on Teacher Detect head to capture Neck features
     detect_module = teacher.model[-1] if hasattr(teacher, "model") else teacher.head
     teacher_hook = TeacherDetectHook(detect_module)
 
-    # --- 6. Loss and Optimizer ---
-    # Student channels: [64, 128, 256], Teacher channels: [256, 512, 512]
-    # Under w=0.25 (Nano) and w=1.00 (Large)
+    # ------------------------------------------------------------------
+    # PHASE 1 — Cache all Teacher outputs in RAM
+    # ------------------------------------------------------------------
+    ram_cache = cache_teacher_outputs(teacher, teacher_hook, raw_loader, device)
+
+    # Free Teacher from GPU — no longer needed after caching
+    teacher_hook.close()
+    del teacher
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    print("[Phase 1] Teacher removed from GPU. VRAM freed for student training.")
+
+    # ------------------------------------------------------------------
+    # Build Phase 2 DataLoader from RAM cache
+    # ------------------------------------------------------------------
+    cached_dataset = CachedTeacherDataset(ram_cache)
+    cached_loader  = DataLoader(
+        cached_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=0,          # Data already in RAM — no I/O workers needed
+        collate_fn=cached_collate_fn,
+    )
+
+    # ------------------------------------------------------------------
+    # Step D: Distillation Loss & Optimizer
+    # ------------------------------------------------------------------
+    # Student Neck channels (w=0.25 Nano): [64, 128, 256]
+    # Teacher Neck channels (w=1.00 Large): [256, 512, 512]
     distill_loss_fn = YOLO26DistillationLoss(
         student_channels=(64, 128, 256),
         teacher_channels=(256, 512, 512),
-        tau=2.0
+        tau=2.0,
     ).to(device)
 
-    # Trainable parameters include Student model and the Conv1x1 projections inside the Loss class
+    student_para_trainable = filter(lambda p : p.requires_grad , student.parameters())
     optimizer = optim.AdamW(
-        list(student.parameters()) + list(distill_loss_fn.parameters()),
+        list(student_para_trainable) + list(distill_loss_fn.parameters()),
         lr=args.lr,
-        weight_decay=1e-4
+        weight_decay=1e-4,
     )
 
-    # --- 7. DataLoader Setup ---
-    # Attempt to load real images from --data-dir, fallback to Dummy if not found
-    if os.path.exists(args.data_dir) and len(glob.glob(os.path.join(args.data_dir, "*"))):
-        print(f"Loading real images from dataset directory: {args.data_dir}")
-        train_dataset = RealImageDataset(img_dir=args.data_dir, img_size=640)
-    else:
-        print(f"Warning: Dataset directory not found or empty at '{args.data_dir}'. Using dummy dataset instead.")
-        train_dataset = DummyCOCODataset(size=8)
-        
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=args.batch_size, 
-        shuffle=True, 
-        num_workers=4 if os.path.exists(args.data_dir) else 0,
-        pin_memory=True if device.type == "cuda" else False
-    )
+    # ------------------------------------------------------------------
+    # PHASE 2 — Train Student from cached Teacher outputs
+    # ------------------------------------------------------------------
+    print(f"\n[Phase 2] Training Student for {args.epochs} epochs "
+          f"| {len(cached_loader)} steps/epoch...")
 
-    # --- 8. Distillation Training Loop ---
-    print(f"\nRunning training loop for {args.epochs} epochs with {len(train_loader)} steps/epoch...")
     student.train()
-    
+    distill_loss_fn.train()
+
     for epoch in range(args.epochs):
-        # progress bar loading effect
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
-        for step, x in enumerate(pbar):
-            x = x.to(device)
-            
-            # Forward pass: Student (returning intermediate features too)
-            s_preds, s_feats = student(x, return_features=True)
-            
-            # Forward pass: Teacher (Features captured by forward hook)
-            with torch.no_grad():
-                t_preds = teacher(x)
-                # If teacher outputs (y, preds) in eval mode, extract the preds dict
-                if isinstance(t_preds, tuple):
-                    t_preds = t_preds[1]
-                t_feats = teacher_hook.features
-            
-            # Calculate Distillation Losses
+        pbar = tqdm(cached_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
+        for imgs, t_preds, t_feats in pbar:
+            imgs = imgs.to(device)
+            t_preds = {
+                branch: {k: v.to(device) for k, v in t_preds[branch].items()}
+                for branch in ["one2many", "one2one"]
+            }
+            t_feats = [f.to(device) for f in t_feats]
+
+            # Student forward — returns (preds, neck_features)
+            s_preds, s_feats = student(imgs, return_features=True)
+
+            # Compute distillation losses
             losses = distill_loss_fn(
                 student_outputs=s_preds,
                 teacher_outputs=t_preds,
                 student_neck_feats=s_feats,
-                teacher_neck_feats=t_feats
+                teacher_neck_feats=t_feats,
             )
-            
-            # Combine losses with weights
-            loss_feat = losses["loss_feat"]
-            loss_cls = losses["loss_cls"]
-            loss_bbox = losses["loss_bbox"]
-            
+
+            loss_feat  = losses["loss_feat"]
+            loss_cls   = losses["loss_cls"]
+            loss_bbox  = losses["loss_bbox"]
             total_loss = 1.0 * loss_feat + 1.0 * loss_cls + 1.5 * loss_bbox
-            
-            # Backward pass
+
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
-            
-            # Update progress bar details dynamically
+
             pbar.set_postfix({
-                "Loss": f"{total_loss.item():.4f}",
-                "Feat": f"{loss_feat.item():.4f}",
-                "Cls": f"{loss_cls.item():.4f}",
-                "BBox": f"{loss_bbox.item():.4f}"
+                "Loss":  f"{total_loss.item():.4f}",
+                "Feat":  f"{loss_feat.item():.4f}",
+                "Cls":   f"{loss_cls.item():.4f}",
+                "BBox":  f"{loss_bbox.item():.4f}",
             })
 
-    # Remove the hook
-    teacher_hook.close()
-    
-    # --- 9. Save Student Model ---
-    save_path = "yolo26n_custom_distilled.pt"
-    print(f"\nSaving trained student model weights to {save_path}...")
-    torch.save(student.state_dict(), save_path)
-    print("Model saved successfully!")
-    
-    print("\nSetup verified and ready to run on Google Colab!")
+    # ------------------------------------------------------------------
+    # Save distilled Student weights
+    # ------------------------------------------------------------------
+    print(f"\n[Save] Saving student weights to '{args.save_path}'...")
+    torch.save(student.state_dict(), args.save_path)
+    print(f"[Save] Done. Distilled model saved: {args.save_path}")
+
 
 if __name__ == "__main__":
     main()
