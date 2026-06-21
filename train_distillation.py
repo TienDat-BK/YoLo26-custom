@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 import json
 import argparse
@@ -235,9 +235,10 @@ def main():
                 t_feats = teacher_hook.features   # [p3, p4, p5] on GPU
 
                 # Slice to person class only → nc=1
+                # Teacher scores shape: [B, 80, num_queries] → slice dim=1
                 t_preds = {
                     branch: {
-                        "scores": t_out[branch]["scores"][:, :, PERSON_IDX:PERSON_IDX+1],
+                        "scores": t_out[branch]["scores"][:, PERSON_IDX:PERSON_IDX+1, :],
                         "boxes":  t_out[branch]["boxes"],
                     }
                     for branch in ["one2many", "one2one"]
