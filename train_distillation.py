@@ -1,3 +1,4 @@
+import math
 import os
 import sys
 import json
@@ -163,7 +164,7 @@ def main():
     # Student  (nc=1 — person only)
     # ------------------------------------------------------------------
     print("\n[Model] Student: YOLO26 Nano  nc=1")
-    student = yolo26n_custom(nc=1, end2end=True).to(device)
+    student = yolo26n_custom(nc=80, end2end=True).to(device)
     if args.weight:
         sd = torch.load(args.weight, map_location=device)
         student.load_state_dict(sd)
@@ -214,6 +215,14 @@ def main():
         weight_decay = 1e-4,
     )
 
+    total_step = len(loader)* args.epochs
+
+    lrScheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer = optimizer,
+        T_max=total_step,
+        eta_min=1e-6,
+    )
+
     # ------------------------------------------------------------------
     # Training loop  — Teacher + Student forward every step
     # ------------------------------------------------------------------
@@ -221,9 +230,15 @@ def main():
     student.train()
     distill_loss.train()
 
+    initiative_feat_weight = 1.0
+    final_feat_weight = 0.05
+
+    num_itr = 0
+
     for epoch in range(args.epochs):
         pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{args.epochs}")
         for imgs in pbar:
+            num_itr+=1
             imgs = imgs.to(device)
 
             # --- Teacher forward (no grad, no weight update) ---
@@ -235,10 +250,10 @@ def main():
                 t_feats = teacher_hook.features   # [p3, p4, p5] on GPU
 
                 # Slice to person class only → nc=1
-                # Teacher scores shape: [B, 80, num_queries] → slice dim=1
+                # Teacher scores shape: [B, 80, num_queries]
                 t_preds = {
                     branch: {
-                        "scores": t_out[branch]["scores"][:, PERSON_IDX:PERSON_IDX+1, :],
+                        "scores": t_out[branch]["scores"],
                         "boxes":  t_out[branch]["boxes"],
                     }
                     for branch in ["one2many", "one2one"]
@@ -255,15 +270,21 @@ def main():
                 teacher_neck_feats = t_feats,
             )
 
+            loss_decay = 0.5 * (1 + math.cos(math.pi * num_itr / total_step))
+            feat_weight = final_feat_weight + (initiative_feat_weight - final_feat_weight) * loss_decay
+
             loss_feat  = losses["loss_feat"]
             loss_cls   = losses["loss_cls"]
             loss_bbox_many  = losses["loss_bbox_many"]
             loss_bbox_one = losses["loss_bbox_one"]
-            total_loss = 1.0 * loss_feat + 1.0 * loss_cls + 1.3 * loss_bbox_many + 1.3 * loss_bbox_one
+            total_loss = feat_weight * loss_feat + 1.0 * loss_cls + 1.3 * loss_bbox_many + 1.3 * loss_bbox_one
 
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
+
+            lrScheduler.step()
+            current_lr = optimizer.param_groups[0]['lr']
 
             pbar.set_postfix({
                 "Loss": f"{total_loss.item():.4f}",
@@ -271,6 +292,8 @@ def main():
                 "Cls":  f"{loss_cls.item():.4f}",
                 "BBox_many": f"{loss_bbox_many.item():.4f}",
                 "BBox_one": f"{loss_bbox_one.item():.4f}",
+                "LR": f"{current_lr:.6f}",
+                "Feat_weigh": f"{feat_weight:.6f}",
             })
 
     # ------------------------------------------------------------------

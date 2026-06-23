@@ -67,11 +67,12 @@ class WebCamStream:
         self.stream.release()
 
 def main():
-    parser = argparse.ArgumentParser(description="YOLO26 Custom Real-Time Webcam Demo")
+    parser = argparse.ArgumentParser(description="YOLO26 Custom Demo")
     parser.add_argument("--weights", type=str, default="yolo26n_custom_distilled.pt", help="Path to weights file (.pt)")
     parser.add_argument("--nc", type=int, default=80, help="Number of classes (80 for COCO, 1 for Face/LFW)")
     parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold")
     parser.add_argument("--camera", type=int, default=0, help="Camera device index")
+    parser.add_argument("--image", type=str, default=None, help="Path to input image for single-image demo")
     args = parser.parse_args()
 
     # Determine class names mapping
@@ -103,37 +104,28 @@ def main():
 
     model.eval()
 
-    # --- 2. Start Video Stream ---
-    print("Starting webcam stream...")
-    vs = WebCamStream(src=args.camera, width=640, height=480).start()
-    time.sleep(1.0) # Wait for camera sensor to warm up
-
-    print("Webcam demo is running. Press 'q' on the output window to exit.")
-    prev_time = time.time()
-
-    with torch.no_grad():
-        while True:
-            grabbed, frame = vs.read()
-            if not grabbed or frame is None:
-                print("Failed to grab frame from camera. Exiting...")
-                break
-
-            h_orig, w_orig = frame.shape[:2]
-
+    # --- 2. Run Single-Image Demo or Webcam Stream ---
+    if args.image:
+        if not os.path.exists(args.image):
+            print(f"Error: Image file '{args.image}' not found.")
+            sys.exit(1)
+        
+        frame = cv2.imread(args.image)
+        if frame is None:
+            print(f"Error: Failed to read image from '{args.image}'.")
+            sys.exit(1)
+            
+        h_orig, w_orig = frame.shape[:2]
+        
+        with torch.no_grad():
             # --- 3. Preprocess Frame for YOLO ---
-            # BGR to RGB
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            # Resize to 640x640
             resized = cv2.resize(rgb_frame, (640, 640))
-            # Normalize and reshape to tensor
             img_tensor = torch.from_numpy(resized).permute(2, 0, 1).float() / 255.0
             img_tensor = img_tensor.unsqueeze(0).to(device)  # Shape: [1, 3, 640, 640]
 
             # --- 4. Forward Pass ---
             outputs = model(img_tensor)
-            
-            # Extract predictions: model in eval mode returns (y, preds)
-            # where y has shape: [1, max_det, 6] = [x1, y1, x2, y2, score, class_idx]
             if isinstance(outputs, tuple):
                 y = outputs[0]
             else:
@@ -144,24 +136,18 @@ def main():
             # --- 5. Draw Detections ---
             for det in detections:
                 x1, y1, x2, y2, score, class_idx = det
-                
-                # Filter by confidence threshold
                 if score < args.conf:
                     continue
 
                 class_idx = int(class_idx)
                 label_name = class_names[class_idx] if class_idx < len(class_names) else f"class_{class_idx}"
 
-                # Rescale coordinates to original frame resolution
                 rx1 = int(x1 * (w_orig / 640.0))
                 ry1 = int(y1 * (h_orig / 640.0))
                 rx2 = int(x2 * (w_orig / 640.0))
                 ry2 = int(y2 * (h_orig / 640.0))
 
-                # Draw bounding box (Green)
                 cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (46, 204, 113), 2)
-                
-                # Draw label text
                 label_str = f"{label_name}: {score:.2f}"
                 cv2.putText(
                     frame,
@@ -173,34 +159,98 @@ def main():
                     2,
                     lineType=cv2.LINE_AA
                 )
+        
+        cv2.imshow("YOLO26 Custom Model - Image Demo", frame)
+        print("Image demo is running. Press any key on the output window to exit.")
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+        print("Demo closed.")
+    else:
+        print("Starting webcam stream...")
+        vs = WebCamStream(src=args.camera, width=640, height=480).start()
+        time.sleep(1.0) # Wait for camera sensor to warm up
 
-            # --- 6. Calculate and Display FPS ---
-            curr_time = time.time()
-            fps = 1.0 / (curr_time - prev_time)
-            prev_time = curr_time
+        print("Webcam demo is running. Press 'q' on the output window to exit.")
+        prev_time = time.time()
 
-            cv2.putText(
-                frame,
-                f"FPS: {fps:.1f}",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 0),
-                2,
-                lineType=cv2.LINE_AA
-            )
+        with torch.no_grad():
+            while True:
+                grabbed, frame = vs.read()
+                if not grabbed or frame is None:
+                    print("Failed to grab frame from camera. Exiting...")
+                    break
 
-            # Display output window
-            cv2.imshow("YOLO26 Custom Model Demo", frame)
+                h_orig, w_orig = frame.shape[:2]
 
-            # Break loop on 'q' press
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+                # --- 3. Preprocess Frame for YOLO ---
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                resized = cv2.resize(rgb_frame, (640, 640))
+                img_tensor = torch.from_numpy(resized).permute(2, 0, 1).float() / 255.0
+                img_tensor = img_tensor.unsqueeze(0).to(device)  # Shape: [1, 3, 640, 640]
 
-    # Clean up
-    vs.stop()
-    cv2.destroyAllWindows()
-    print("Demo closed.")
+                # --- 4. Forward Pass ---
+                outputs = model(img_tensor)
+                if isinstance(outputs, tuple):
+                    y = outputs[0]
+                else:
+                    y = outputs
+
+                detections = y[0].cpu().numpy()  # Shape: [max_det, 6]
+
+                # --- 5. Draw Detections ---
+                for det in detections:
+                    x1, y1, x2, y2, score, class_idx = det
+                    if score < args.conf:
+                        continue
+
+                    class_idx = int(class_idx)
+                    label_name = class_names[class_idx] if class_idx < len(class_names) else f"class_{class_idx}"
+
+                    rx1 = int(x1 * (w_orig / 640.0))
+                    ry1 = int(y1 * (h_orig / 640.0))
+                    rx2 = int(x2 * (w_orig / 640.0))
+                    ry2 = int(y2 * (h_orig / 640.0))
+
+                    cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (46, 204, 113), 2)
+                    label_str = f"{label_name}: {score:.2f}"
+                    cv2.putText(
+                        frame,
+                        label_str,
+                        (rx1, max(ry1 - 10, 15)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (46, 204, 113),
+                        2,
+                        lineType=cv2.LINE_AA
+                    )
+
+                # --- 6. Calculate and Display FPS ---
+                curr_time = time.time()
+                fps = 1.0 / (curr_time - prev_time)
+                prev_time = curr_time
+
+                cv2.putText(
+                    frame,
+                    f"FPS: {fps:.1f}",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 255, 0),
+                    2,
+                    lineType=cv2.LINE_AA
+                )
+
+                # Display output window
+                cv2.imshow("YOLO26 Custom Model Demo", frame)
+
+                # Break loop on 'q' press
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+
+        # Clean up
+        vs.stop()
+        cv2.destroyAllWindows()
+        print("Demo closed.")
 
 if __name__ == "__main__":
     main()
