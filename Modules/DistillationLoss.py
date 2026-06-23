@@ -49,7 +49,7 @@ class YOLO26DistillationLoss(nn.Module):
                 max_prob, _ = t_probs.max(dim=1, keepdim=True)
                 mask = (max_prob > gt_thresh).float()  # Shape chuẩn: (B, 1, Anchors)
             
-            # . Classification Distillation Loss (Soft BCE) 
+            # . Classification Distillation Loss (Soft BCE) ko mask
             t_soft_targets = torch.sigmoid(t_scores / self.tau)
             
             loss_cls_elementwise = F.binary_cross_entropy_with_logits(
@@ -57,11 +57,15 @@ class YOLO26DistillationLoss(nn.Module):
                 t_soft_targets,
                 reduction='none'
             )
-            loss_cls += (loss_cls_elementwise * mask).mean() * (self.tau ** 2)
+            loss_cls += (loss_cls_elementwise).mean() * (self.tau ** 2)
             
             # . Bounding Box Distillation Loss 
+
+            # THÊM .clamp(min=1.0) ĐỂ TRÁNH LỖI CHIA CHO 0
+            num_masked = mask.sum().clamp(min=1.0)
+
             loss_bbox_elementwise = F.smooth_l1_loss(s_boxes, t_boxes, reduction='none')
-            loss_bbox_scalar = (loss_bbox_elementwise * mask).mean()
+            loss_bbox_scalar = (loss_bbox_elementwise * mask).sum() / num_masked
             
             #  về đúng biến đầu ra tương ứng
             if branch == "one2many":

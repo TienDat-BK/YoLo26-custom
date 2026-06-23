@@ -179,38 +179,44 @@ class Detect(nn.Module):
         return self.postprocess(fused.permute(0, 2, 1))       # (B, max_det, 6)
 
     def _build_stride_vec(self, feats: list[torch.Tensor]) -> None:
-        """Build and cache the per-anchor stride vector (vectorized, no Python loop over anchors).
+        strides = []
+        grids = []
+        
+        for i, f in enumerate(feats):
+            _, _, h, w = f.shape
+            stride_val = self.stride[i]
+            
+            # Tạo tọa độ (x, y) cho từng ô lưới
+            y, x = torch.meshgrid(torch.arange(h, device=f.device),
+                                torch.arange(w, device=f.device), indexing='ij')
+            
+            # Lấy tâm của ô lưới (+0.5)
+            grid = torch.stack([x, y], dim=-1).float() + 0.5  # (h, w, 2)
+            
+            # Mạng của bạn output 4 tọa độ (x1, y1, x2, y2)
+            # Ta nhân đôi grid lên để cộng (grid_x, grid_y) cho cả 2 điểm
+            grid = grid.repeat(1, 1, 2).view(-1, 4)           # (h*w, 4)
+            grids.append(grid)
+            
+            # Tạo mảng stride tương ứng
+            strides.append(torch.full((h * w, 1), stride_val, device=f.device))
 
-        Creates a 1D tensor of shape (A,) where each position holds the stride
-        of its corresponding feature level.
-
-        Only recomputed when feature-map spatial sizes change (e.g. different input resolution).
-        """
-        # FIX 6: fully vectorized — repeat_interleave instead of Python loop
-        sizes = torch.tensor(
-            [f.shape[2] * f.shape[3] for f in feats],
-            dtype=torch.long, device=self.stride.device
-        )  # (nl,)
-        self._stride_vec = self.stride.repeat_interleave(sizes)  # (A,)
+        # Đăng ký thành buffer để tính toán cực nhanh qua các Batch
+        self.register_buffer('_anchor_grid', torch.cat(grids, dim=0).unsqueeze(0).permute(0, 2, 1)) # (1, 4, A)
+        self.register_buffer('_stride_vec', torch.cat(strides, dim=0).unsqueeze(0).permute(0, 2, 1)) # (1, 1, A)
         self._cached_feat_shape = tuple(f.shape[2:] for f in feats)
 
     def _get_decode_boxes(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Convert raw box predictions from feature-map space to pixel space.
-
-        Multiplying by the stride converts each coord to original image scale.
-
-        Returns:
-            Tensor (B, 4, A): boxes in pixel coordinates.
-        """
         feats = x["feats"]
         feat_shape = tuple(f.shape[2:] for f in feats)
         if self.dynamic or self._cached_feat_shape != feat_shape:
             self._build_stride_vec(feats)
 
-        # FIX 7: view as (1, 1, A) for broadcast — single elementwise multiply, no copy
-        return x["boxes"] * self._stride_vec.view(1, 1, -1)  # (B, 4, A)
+        # ĐÃ SỬA: Phải cộng hệ quy chiếu Grid vào trước khi nhân Stride!
+        # Công thức: x_img = (x_feat + grid) * stride
+        return (x["boxes"] + self._anchor_grid) * self._stride_vec
 
-    # ── post-processing ───────────────────────────────────────────────────────
+        # ── post-processing ───────────────────────────────────────────────────────
 
     def postprocess(self, preds: torch.Tensor) -> torch.Tensor:
         """Select top-k detections.
@@ -222,9 +228,12 @@ class Detect(nn.Module):
             Tensor (B, max_det, 6): [x1, y1, x2, y2, max_score, class_idx].
         """
         boxes, scores = preds.split([4, self.nc], dim=-1)  # (B,A,4), (B,A,nc)
-        scores, conf, idx = self.get_topk_index(scores, self.max_det)
-        boxes = boxes.gather(dim=1, index=idx.expand(-1, -1, 4))
-        return torch.cat([boxes, scores, conf], dim=-1)
+        
+        # Hứng đúng tên bản chất
+        topk_scores, topk_class_idx, topk_anchor_idx = self.get_topk_index(scores, self.max_det)
+
+        boxes = boxes.gather(dim=1, index=topk_anchor_idx.expand(-1, -1, 4))
+        return torch.cat([boxes, topk_scores, topk_class_idx], dim=-1)
 
     def get_topk_index(
         self, scores: torch.Tensor, max_det: int
