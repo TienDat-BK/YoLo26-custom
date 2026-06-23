@@ -257,8 +257,9 @@ def main():
 
             loss_feat  = losses["loss_feat"]
             loss_cls   = losses["loss_cls"]
-            loss_bbox  = losses["loss_bbox"]
-            total_loss = 1.0 * loss_feat + 1.0 * loss_cls + 1.5 * loss_bbox
+            loss_bbox_many  = losses["loss_bbox_many"]
+            loss_bbox_one = losses["loss_bbox_one"]
+            total_loss = 1.0 * loss_feat + 1.0 * loss_cls + 1.3 * loss_bbox_many + 1.3 * loss_bbox_one
 
             optimizer.zero_grad()
             total_loss.backward()
@@ -268,7 +269,8 @@ def main():
                 "Loss": f"{total_loss.item():.4f}",
                 "Feat": f"{loss_feat.item():.4f}",
                 "Cls":  f"{loss_cls.item():.4f}",
-                "BBox": f"{loss_bbox.item():.4f}",
+                "BBox_many": f"{loss_bbox_many.item():.4f}",
+                "BBox_one": f"{loss_bbox_one.item():.4f}",
             })
 
     # ------------------------------------------------------------------

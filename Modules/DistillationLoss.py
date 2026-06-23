@@ -12,46 +12,66 @@ class YOLO26DistillationLoss(nn.Module):
             nn.Conv2d(s_ch, t_ch, kernel_size=1, bias=False)
             for s_ch, t_ch in zip(student_channels, teacher_channels)
         ])
-        
-        self.bce_soft = nn.BCEWithLogitsLoss(reduction="mean")
 
     def forward(self, student_outputs, teacher_outputs, student_neck_feats, teacher_neck_feats):
         """
         Args:
             student_outputs (dict): Raw `preds` from Student containing "one2many" and "one2one".
-            teacher_outputs (dict): Raw `preds` from Teacher containing "one2many" and "one2one".
+            teacher_outputs (dict): Pre-processed `preds` from Teacher (already sliced to nc=1).
             student_neck_feats (list[Tensor]): Neck feature outputs of Student ([S3, S4, S5]).
             teacher_neck_feats (list[Tensor]): Neck feature outputs of Teacher ([T3, T4, T5]).
         """
-        # --- 1. Feature Map Distillation Loss (MSE) ---
+        #  Feature Map Distillation Loss (MSE)
         loss_feat = 0.0
         for i, (s_feat, t_feat) in enumerate(zip(student_neck_feats, teacher_neck_feats)):
             proj_s_feat = self.proj_layers[i](s_feat)
             loss_feat += F.mse_loss(proj_s_feat, t_feat)
             
-        # --- 2. Classification Distillation Loss (Sigmoid BCE with Soft Targets) ---
+        # Khởi tạo các biến chứa giá trị Loss dạng scalar tensor
         loss_cls = 0.0
+        loss_bbox_many = torch.tensor(0.0, device=student_neck_feats[0].device)
+        loss_bbox_one = torch.tensor(0.0, device=student_neck_feats[0].device)
+        
+        gt_thresh = 0.3  # Ngưỡng lọc nền
+
+        # Chạy vòng lặp tính toán song song cho cả 2 chiến lược gán nhãn
         for branch in ["one2many", "one2one"]:
-            s_scores = student_outputs[branch]["scores"]  # Student raw logits
-            t_scores = teacher_outputs[branch]["scores"]  # Teacher raw logits
+            s_scores = student_outputs[branch]["scores"]  # (B, 1, Anchors)
+            t_scores = teacher_outputs[branch]["scores"]  # (B, 1, Anchors) - Đã xử lý từ ngoài
             
-            # Make Teacher target soft by applying sigmoid with temperature
+            s_boxes = student_outputs[branch]["boxes"]    # (B, 4*reg_max, Anchors)
+            t_boxes = teacher_outputs[branch]["boxes"]    # (B, 4*reg_max, Anchors)
+
+            #  Tạo mask:
+            with torch.no_grad():
+                t_probs = torch.sigmoid(t_scores)
+                # Giữ lại .max(dim=1) như một lớp bảo vệ (safeguard) nếu sau này bạn đổi số class
+                max_prob, _ = t_probs.max(dim=1, keepdim=True)
+                mask = (max_prob > gt_thresh).float()  # Shape chuẩn: (B, 1, Anchors)
+            
+            # . Classification Distillation Loss (Soft BCE) 
             t_soft_targets = torch.sigmoid(t_scores / self.tau)
             
-            # Compute soft-BCE loss
-            loss_cls += self.bce_soft(s_scores / self.tau, t_soft_targets) * (self.tau ** 2)
+            loss_cls_elementwise = F.binary_cross_entropy_with_logits(
+                s_scores / self.tau,
+                t_soft_targets,
+                reduction='none'
+            )
+            loss_cls += (loss_cls_elementwise * mask).mean() * (self.tau ** 2)
             
-        # --- 3. Bounding Box Distillation Loss (L1 on raw boxes) ---
-        loss_bbox = 0.0
-        for branch in ["one2many", "one2one"]:
-            s_boxes = student_outputs[branch]["boxes"]  # Student raw boxes
-            t_boxes = teacher_outputs[branch]["boxes"]  # Teacher raw boxes
+            # . Bounding Box Distillation Loss 
+            loss_bbox_elementwise = F.smooth_l1_loss(s_boxes, t_boxes, reduction='none')
+            loss_bbox_scalar = (loss_bbox_elementwise * mask).mean()
             
-            # L1 Loss directly on the coordinate logits
-            loss_bbox += F.mse_loss(s_boxes, t_boxes)
+            #  về đúng biến đầu ra tương ứng
+            if branch == "one2many":
+                loss_bbox_many = loss_bbox_scalar
+            elif branch == "one2one":
+                loss_bbox_one = loss_bbox_scalar
 
         return {
             "loss_feat": loss_feat,
             "loss_cls": loss_cls,
-            "loss_bbox": loss_bbox
+            "loss_bbox_many": loss_bbox_many,
+            "loss_bbox_one": loss_bbox_one
         }
