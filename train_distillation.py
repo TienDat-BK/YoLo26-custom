@@ -1,3 +1,4 @@
+from functools import cache
 from Modules import DistillationLoss
 from torch._utils import _get_async_or_non_blocking
 from operator import imod
@@ -156,6 +157,7 @@ def main():
                         help="Student pretrain weight path")
     parser.add_argument("--save-path",   type=str,
                         default="yolo26n_person_distilled.pt")
+    parser.add_argument("--input-cache", action="store_true", help=" active image caching")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -170,6 +172,7 @@ def main():
             ann_file    = args.ann_file,
             max_samples = args.max_samples,
             img_size    = args.img_size,
+            cache       = args.input_cache,
         )
     else:
         print("[Data] data-dir / ann-file not found — using dummy dataset.")
