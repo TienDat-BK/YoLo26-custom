@@ -1,4 +1,5 @@
 import torch
+import torch
 import torch.nn.functional as F
 from torch import nn
 from Modules.blocks import Conv, DWConv
@@ -82,10 +83,10 @@ class Detect(nn.Module):
             self.one2one_cv2 = copy.deepcopy(self.cv2)
             self.one2one_cv3 = copy.deepcopy(self.cv3)
 
-        # FIX 2: stride_vec as buffer so it persists across calls and moves with .cuda()
-        # Initialized to None; built on first forward() call
-        self.register_buffer("_stride_vec", None)
+        self.register_buffer("stride_vec", None)
+        self.register_buffer("anchor_positions", None)
         self._cached_feat_shape: tuple | None = None
+        
 
     # ── properties ────────────────────────────────────────────────────────────
 
@@ -167,44 +168,40 @@ class Detect(nn.Module):
 
     def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
         """Decode boxes, sigmoid scores, then run postprocess.
-
         Returns:
             Tensor (B, max_det, 6): [x1,y1,x2,y2, score, class_idx]
         """
         dbox   = self._get_decode_boxes(x)                   # (B, 4,  A)
         scores = x["scores"].sigmoid()                        # (B, nc, A)
-        # FIX 5: keep channel-first (B, 4+nc, A), then do a single permute inside postprocess
-        # avoids a redundant contiguous() copy
         fused  = torch.cat((dbox, scores), dim=1)            # (B, 4+nc, A)
         return self.postprocess(fused.permute(0, 2, 1))       # (B, max_det, 6)
 
     def _build_stride_vec(self, feats: list[torch.Tensor]) -> None:
         strides = []
         grids = []
-        
+        #  (l, t, r, b)
         for i, f in enumerate(feats):
             _, _, h, w = f.shape
-            stride_val = self.stride[i]
-            
-            # Tạo tọa độ (x, y) cho từng ô lưới
-            y, x = torch.meshgrid(torch.arange(h, device=f.device),
-                                torch.arange(w, device=f.device), indexing='ij')
-            
-            # Lấy tâm của ô lưới (+0.5)
-            grid = torch.stack([x, y], dim=-1).float() + 0.5  # (h, w, 2)
-            
-            # Mạng của bạn output 4 tọa độ (x1, y1, x2, y2)
-            # Ta nhân đôi grid lên để cộng (grid_x, grid_y) cho cả 2 điểm
-            grid = grid.repeat(1, 1, 2).view(-1, 4)           # (h*w, 4)
-            grids.append(grid)
-            
-            # Tạo mảng stride tương ứng
-            strides.append(torch.full((h * w, 1), stride_val, device=f.device))
 
-        # Đăng ký thành buffer để tính toán cực nhanh qua các Batch
-        self.register_buffer('_anchor_grid', torch.cat(grids, dim=0).unsqueeze(0).permute(0, 2, 1)) # (1, 4, A)
-        self.register_buffer('_stride_vec', torch.cat(strides, dim=0).unsqueeze(0).permute(0, 2, 1)) # (1, 1, A)
-        self._cached_feat_shape = tuple(f.shape[2:] for f in feats)
+            # tạo lưới tọa độ
+            y, x = torch.meshgrid(
+                torch.arange(h, device=f.device),
+                torch.arange(w, device=f.device),
+                indexing="ij"
+            )
+            grid = torch.stack([x,y], dim=0).float() + 0.5  # (2, h, w)
+            grid = grid.view(2, -1)
+            grids.append(grid)
+
+        #anchor_position !!
+        anchor_positions = torch.cat(grids, dim = 1)
+        self.anchor_positions = anchor_positions.unsqueeze(0)
+
+        # strides !!
+        total_anchors = torch.tensor([f.shape[2] * f.shape[3] for f in feats], device=self.stride.device)
+        stride_vec = torch.repeat_interleave(self.stride, total_anchors).view(1, 1, -1)
+        self.stride_vec = stride_vec # (1, 1, anchors)
+                
 
     def _get_decode_boxes(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
         feats = x["feats"]
@@ -212,9 +209,10 @@ class Detect(nn.Module):
         if self.dynamic or self._cached_feat_shape != feat_shape:
             self._build_stride_vec(feats)
 
-        # ĐÃ SỬA: Phải cộng hệ quy chiếu Grid vào trước khi nhân Stride!
-        # Công thức: x_img = (x_feat + grid) * stride
-        return (x["boxes"] + self._anchor_grid) * self._stride_vec
+        bbox = x["boxes"]
+        lt_position = ( self.anchor_positions - bbox[:, :2, :] ) * self.stride_vec
+        rb_position = ( self.anchor_positions + bbox[:, 2:, :] ) * self.stride_vec
+        return torch.cat([lt_position,rb_position], dim=1)
 
         # ── post-processing ───────────────────────────────────────────────────────
 
@@ -256,12 +254,10 @@ class Detect(nn.Module):
             labels = labels.gather(1, indices)
             return scores, labels, indices
 
-        # FIX 8: replace idx.repeat with idx.expand — no memory copy
         ori_index = scores.max(dim=-1)[0].topk(k)[1].unsqueeze(-1)         # (B, k, 1)
         scores    = scores.gather(dim=1, index=ori_index.expand(-1, -1, nc))
         scores, index = scores.flatten(1).topk(k)
 
-        # FIX 9: cache arange on same device to avoid re-allocation every call
         batch_idx = torch.arange(batch_size, device=scores.device).unsqueeze(1)  # (B,1)
         idx = ori_index[batch_idx, index // nc]  # (B, k, 1)
 

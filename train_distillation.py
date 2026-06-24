@@ -1,3 +1,5 @@
+from torch._utils import _get_async_or_non_blocking
+from operator import imod
 import math
 import os
 import sys
@@ -6,7 +8,7 @@ import argparse
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
-
+import numpy as np
 try:
     from PIL import Image
 except ImportError:
@@ -63,9 +65,9 @@ class COCOPersonDataset(Dataset):
     """
     PERSON_CAT_ID = 1   # Fixed in every COCO release
 
-    def __init__(self, img_dir, ann_file, max_samples=None, img_size=640):
+    def __init__(self, img_dir, ann_file, max_samples=None, img_size=640, cache = True):
         self.img_size = img_size
-
+        self.cache = cache
         print(f"[Data] Parsing annotation file: {ann_file}")
         with open(ann_file, "r") as f:
             coco = json.load(f)
@@ -92,6 +94,17 @@ class COCOPersonDataset(Dataset):
             T.ToTensor(),
         ]) if T else None
 
+        self.img_cache = []
+        
+        if self.cache:
+            print("Caching Dataset ...............")
+            for idx in range(len(self.paths)):
+                img = Image.open(self.paths[idx]).convert("RGB")
+                img_resized = img.resize((self.img_size, self.img_size))
+                img_tensor = torch.from_numpy(np.array(img_resized)).permute(2, 0, 1).contiguous()
+                self.img_cache.append(img_tensor)
+            print("Caching Done!!!!!!!!!!!!!")
+
         print(f"[Data] {len(self.paths)} person images loaded "
               f"(cap={max_samples}).")
 
@@ -100,8 +113,11 @@ class COCOPersonDataset(Dataset):
 
     def __getitem__(self, idx):
         try:
-            img = Image.open(self.paths[idx]).convert("RGB")
-            return self.transform(img) if self.transform else img
+            if self.cache:
+                return self.img_cache[idx].float() / 255.0
+            else:
+                img = Image.open(self.paths[idx]).convert("RGB")
+                return self.transform(img) if self.transform else img
         except Exception:
             return self.__getitem__(0)
 
@@ -156,7 +172,7 @@ def main():
         dataset,
         batch_size  = args.batch_size,
         shuffle     = True,
-        num_workers = 2,
+        num_workers = 4,
         pin_memory  = (device.type == "cuda"),
     )
 
@@ -168,8 +184,11 @@ def main():
     if args.weight:
         sd = torch.load(args.weight, map_location=device)
         student.load_state_dict(sd)
-        for p in student.backbone.parameters():
-            p.requires_grad = False
+
+        # KO ĐÓNG BĂNG BACKBONE
+        # for p in student.backbone.parameters():
+        #     p.requires_grad = False
+
         print(f"[Model] Loaded pretrain weight: {args.weight}")
 
     # ------------------------------------------------------------------
@@ -205,14 +224,14 @@ def main():
     distill_loss = YOLO26DistillationLoss(
         student_channels = (64, 128, 256),
         teacher_channels = (256, 512, 512),
-        tau = 2.0,
+        tau = 1.5,
     ).to(device)
 
     trainable = filter(lambda p: p.requires_grad, student.parameters())
     optimizer  = optim.AdamW(
         list(trainable) + list(distill_loss.parameters()),
         lr           = args.lr,
-        weight_decay = 1e-4,
+        weight_decay = 1e-5,
     )
 
     total_step = len(loader)* args.epochs
@@ -230,8 +249,8 @@ def main():
     student.train()
     distill_loss.train()
 
-    initiative_feat_weight = 1.0
-    final_feat_weight = 0.05
+    initiative_feat_weight = 0
+    final_feat_weight = 0
 
     num_itr = 0
 
@@ -239,7 +258,7 @@ def main():
         pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{args.epochs}")
         for imgs in pbar:
             num_itr+=1
-            imgs = imgs.to(device)
+            imgs = imgs.to(device, non_blocking=True)
 
             # --- Teacher forward (no grad, no weight update) ---
             with torch.no_grad():
@@ -277,7 +296,7 @@ def main():
             loss_cls   = losses["loss_cls"]
             loss_bbox_many  = losses["loss_bbox_many"]
             loss_bbox_one = losses["loss_bbox_one"]
-            total_loss = feat_weight * loss_feat + 1.0 * loss_cls + 1.3 * loss_bbox_many + 1.3 * loss_bbox_one
+            total_loss = feat_weight * loss_feat + 1.0 * loss_cls + 1 * loss_bbox_many + 1 * loss_bbox_one
 
             optimizer.zero_grad()
             total_loss.backward()

@@ -2,7 +2,7 @@ from ultralytics import YOLO
 from Modules.Model import yolo26n_custom
 import torch
 
-my_model = yolo26n_custom(1)
+my_model = yolo26n_custom(nc=80)
 teacher = YOLO("yolo26n.pt").model
 yolo_backbone = teacher.model[:9]
 
