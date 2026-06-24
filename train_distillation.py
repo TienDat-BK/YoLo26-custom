@@ -99,11 +99,20 @@ class COCOPersonDataset(Dataset):
         
         if self.cache:
             print("Caching Dataset ...............")
-            for idx in range(len(self.paths)):
+
+            for idx in tqdm(
+                range(len(self.paths)),
+                desc="Caching Images",
+                unit="img"
+            ):
                 img = Image.open(self.paths[idx]).convert("RGB")
                 img_resized = img.resize((self.img_size, self.img_size))
-                img_tensor = torch.from_numpy(np.array(img_resized)).permute(2, 0, 1).contiguous()
+                img_tensor = torch.from_numpy(
+                    np.array(img_resized)
+                ).permute(2, 0, 1).contiguous()
+
                 self.img_cache.append(img_tensor)
+
             print("Caching Done!!!!!!!!!!!!!")
 
         print(f"[Data] {len(self.paths)} person images loaded "
@@ -235,7 +244,7 @@ def main():
         weight_decay = 1e-5,
     )
     use_amp = (device.type == "cuda")
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler(enabled=use_amp)
 
     total_step = len(loader)* args.epochs
     
@@ -286,13 +295,13 @@ def main():
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
                 s_preds, s_feats = student(imgs, return_features=True)
 
-            # --- Distillation losses ---
-            losses = distill_loss(
-                student_outputs    = s_preds,
-                teacher_outputs    = t_preds,
-                student_neck_feats = s_feats,
-                teacher_neck_feats = t_feats,
-            )
+                # --- Distillation losses ---
+                losses = distill_loss(
+                    student_outputs    = s_preds,
+                    teacher_outputs    = t_preds,
+                    student_neck_feats = s_feats,
+                    teacher_neck_feats = t_feats,
+                )
 
             loss_decay = 0.5 * (1 + math.cos(math.pi * num_itr / total_step))
             feat_weight = final_feat_weight + (initiative_feat_weight - final_feat_weight) * loss_decay
