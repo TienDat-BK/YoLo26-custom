@@ -115,9 +115,11 @@ class COCOPersonDataset(Dataset):
                 self.img_cache.append(img_tensor)
 
             print("Caching Done!!!!!!!!!!!!!")
+        else:
+            print("NON-CACHE!!!!!!")
 
         print(f"[Data] {len(self.paths)} person images loaded "
-              f"(cap={max_samples}).")
+              f"(cap={len(self.paths)}).")
 
     def __len__(self):
         return len(self.paths)
@@ -185,7 +187,7 @@ def main():
         dataset,
         batch_size  = args.batch_size,
         shuffle     = True,
-        num_workers = 4,
+        num_workers = 2,
         pin_memory  = (device.type == "cuda"),
     )
 
