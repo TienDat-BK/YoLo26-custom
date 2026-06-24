@@ -1,3 +1,4 @@
+from Modules import DistillationLoss
 from torch._utils import _get_async_or_non_blocking
 from operator import imod
 import math
@@ -233,9 +234,11 @@ def main():
         lr           = args.lr,
         weight_decay = 1e-5,
     )
+    use_amp = (device.type == "cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     total_step = len(loader)* args.epochs
-
+    
     lrScheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer = optimizer,
         T_max=total_step,
@@ -261,25 +264,27 @@ def main():
             imgs = imgs.to(device, non_blocking=True)
 
             # --- Teacher forward (no grad, no weight update) ---
-            with torch.no_grad():
-                t_out = teacher(imgs)
-                if isinstance(t_out, tuple):
-                    t_out = t_out[1]   # raw dict
+            with torch.inference_mode():
+                with torch.autocast(device_type="cuda", enabled=use_amp):
+                    t_out = teacher(imgs)
+                    if isinstance(t_out, tuple):
+                        t_out = t_out[1]   # raw dict
 
-                t_feats = teacher_hook.features   # [p3, p4, p5] on GPU
+                    t_feats = teacher_hook.features   # [p3, p4, p5] on GPU
 
-                # Slice to person class only → nc=1
-                # Teacher scores shape: [B, 80, num_queries]
-                t_preds = {
-                    branch: {
-                        "scores": t_out[branch]["scores"],
-                        "boxes":  t_out[branch]["boxes"],
+                    # Slice to person class only → nc=1
+                    # Teacher scores shape: [B, 80, num_queries]
+                    t_preds = {
+                        branch: {
+                            "scores": t_out[branch]["scores"],
+                            "boxes":  t_out[branch]["boxes"],
+                        }
+                        for branch in ["one2many", "one2one"]
                     }
-                    for branch in ["one2many", "one2one"]
-                }
 
             # --- Student forward ---
-            s_preds, s_feats = student(imgs, return_features=True)
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                s_preds, s_feats = student(imgs, return_features=True)
 
             # --- Distillation losses ---
             losses = distill_loss(
@@ -298,9 +303,15 @@ def main():
             loss_bbox_one = losses["loss_bbox_one"]
             total_loss = feat_weight * loss_feat + 1.0 * loss_cls + 1 * loss_bbox_many + 1 * loss_bbox_one
 
-            optimizer.zero_grad()
-            total_loss.backward()
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            if use_amp:
+                scaler.scale(total_loss).backward()
+                scaler.step(optimizer=optimizer)
+                scaler.update()
+            else:
+                total_loss.backward()
+                optimizer.step()
+
 
             lrScheduler.step()
             current_lr = optimizer.param_groups[0]['lr']
