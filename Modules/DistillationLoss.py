@@ -19,11 +19,19 @@ class QuantityFocalLoss(nn.Module):
             hardlabel -> filter anchor which > threshold
         """
         if hard_label:
-            # Dùng Focal Loss chuẩn: alpha * (1 - p)^gamma * BCE(pred, hard_target)
+            # 1. Standard Focal Loss
             hard_target = (target > self.threshold).float()
             p = torch.sigmoid(pred)
+            
+            # Tính toán p_t và alpha_t
+            # Nếu hard_target == 1 -> p_t = p, alpha_t = self.alpha
+            # Nếu hard_target == 0 -> p_t = 1 - p, alpha_t = 1 - self.alpha
+            p_t = p * hard_target + (1 - p) * (1 - hard_target)
+            alpha_t = self.alpha * hard_target + (1 - self.alpha) * (1 - hard_target)
+            
             bce_loss = F.binary_cross_entropy_with_logits(pred, hard_target, reduction='none')
-            focal_weight = self.alpha * (1 - p) ** self.gamma
+            focal_weight = alpha_t * torch.pow((1 - p_t), self.gamma)
+            
             if reduction == 'none':
                 return focal_weight * bce_loss
             else:

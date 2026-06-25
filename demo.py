@@ -127,6 +127,7 @@ def show_heatmap_window(frame, heatmaps, active_class_idx, class_names, mode="on
     for i, hm in enumerate(heatmaps):
         h_i, w_i = hm.shape
         max_val = hm.max()
+        total = (hm > 0.25).sum().item()
         # Scale color to absolute range [0, 1] where closer to 1 is more intense
         hm_norm = np.clip(hm, 0.0, 1.0)
             
@@ -139,7 +140,7 @@ def show_heatmap_window(frame, heatmaps, active_class_idx, class_names, mode="on
         overlay_small = cv2.resize(overlay, (target_w, target_h))
         
         # Add stride text label
-        label_text = f"Stride {strides[i]} ({h_i}x{w_i}) Max: {max_val:.4f}"
+        label_text = f"Stride {strides[i]} ({h_i}x{w_i}) Max: {max_val:.2f} Total: {total}"
         cv2.putText(
             overlay_small,
             label_text,
