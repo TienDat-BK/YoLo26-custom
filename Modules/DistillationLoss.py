@@ -102,7 +102,7 @@ class YOLO26DistillationLoss(nn.Module):
 
         return {
             "loss_feat": loss_feat,
-            "los_cls_one" : loss_cls_one,
+            "loss_cls_one" : loss_cls_one,
             "loss_cls_many" : loss_cls_many,
             "loss_bbox_many": loss_bbox_many,
             "loss_bbox_one": loss_bbox_one
