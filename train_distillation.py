@@ -312,10 +312,11 @@ def main():
             feat_weight = final_feat_weight + (initiative_feat_weight - final_feat_weight) * loss_decay
 
             loss_feat  = losses["loss_feat"]
-            loss_cls   = losses["loss_cls"]
+            loss_cls_one   = losses["loss_cls_one"]
+            loss_cls_many   = losses["loss_cls_many"]
             loss_bbox_many  = losses["loss_bbox_many"]
             loss_bbox_one = losses["loss_bbox_one"]
-            total_loss = feat_weight * loss_feat + 1.0 * loss_cls + 1 * loss_bbox_many + 1 * loss_bbox_one
+            total_loss = feat_weight * loss_feat + 1.0 * loss_cls_one + 1.0 * loss_cls_many + 1 * loss_bbox_many + 1 * loss_bbox_one
 
             optimizer.zero_grad(set_to_none=True)
             if use_amp:
@@ -333,7 +334,8 @@ def main():
             pbar.set_postfix({
                 "Loss": f"{total_loss.item():.4f}",
                 "Feat": f"{loss_feat.item():.4f}",
-                "Cls":  f"{loss_cls.item():.4f}",
+                "Cls_one":  f"{loss_cls_one.item():.4f}",
+                "Cls_many":  f"{loss_cls_many.item():.4f}",
                 "BBox_many": f"{loss_bbox_many.item():.4f}",
                 "BBox_one": f"{loss_bbox_one.item():.4f}",
                 "LR": f"{current_lr:.6f}",
