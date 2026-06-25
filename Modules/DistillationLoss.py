@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 class QuantityFocalLoss(nn.Module):
     def __init__(self, beta = 0.25):
+        super().__init__()
         self.beta = beta
     
     def forward(self, pred : torch.Tensor, target : torch.Tensor, reduction : str = "yes"):
@@ -13,8 +14,8 @@ class QuantityFocalLoss(nn.Module):
 
             formula : |p - y|^beta * BCE(p, y)
         """
-        super().__init__()
         
+
         p = F.sigmoid(pred)
         bce_loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
         if reduction == 'none':
