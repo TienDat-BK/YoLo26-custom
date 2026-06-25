@@ -3,10 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class QuantityFocalLoss(nn.Module):
-    def __init__(self, beta = 0.25):
+    def __init__(self, beta = 0.25, threshold = 0.25):
         super().__init__()
         self.beta = beta
-    
+        self.threshold = threshold
     def forward(self, pred : torch.Tensor, target : torch.Tensor, reduction : str = "yes"):
         """
             pred : [B, nc, H, W] raw
@@ -21,7 +21,9 @@ class QuantityFocalLoss(nn.Module):
         if reduction == 'none':
             return (torch.abs(p-target) ** self.beta * bce_loss)
         else:
-            return (torch.abs(p-target) ** self.beta * bce_loss).mean()
+            # mask lấy các ô > threshold
+            num_obj = (target > self.threshold).sum()
+            return (torch.abs(p-target) ** self.beta * bce_loss) / num_obj
 
 class YOLO26DistillationLoss(nn.Module):
     def __init__(self, student_channels=(64, 128, 256), teacher_channels=(256, 512, 512), tau=2.0):
