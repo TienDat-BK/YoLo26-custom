@@ -7,14 +7,17 @@ class QuantityFocalLoss(nn.Module):
         super().__init__()
         self.beta = beta
         self.threshold = threshold
-    def forward(self, pred : torch.Tensor, target : torch.Tensor, reduction : str = "yes"):
+        
+    def forward(self, pred : torch.Tensor, target : torch.Tensor, reduction : str = "yes", hard_label : bool = False):
         """
             pred : [B, nc, H, W] raw
             target : [B, nc, H, W] (non-raw)
 
             formula : |p - y|^beta * BCE(p, y)
+            hardlabel -> filter anchor which > threshold
         """
-        
+        if hard_label:
+            target = (target > self.threshold).float()
 
         p = F.sigmoid(pred)
         bce_loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
@@ -26,11 +29,11 @@ class QuantityFocalLoss(nn.Module):
                 num_obj = (target > self.threshold).sum()
             return ((torch.abs(p-target) ** self.beta * bce_loss) / num_obj).sum()
 
-class YOLO26DistillationLoss(nn.Module):
-    def __init__(self, student_channels=(64, 128, 256), teacher_channels=(256, 512, 512), tau=2.0):
+class YOLO26DistillationLoss(nn.Module, ):
+    def __init__(self, student_channels=(64, 128, 256), teacher_channels=(256, 512, 512), tau=2.0, hard_label_for_o2o : bool = True):
         super().__init__()
         self.tau = tau
-        
+        self.hard_label_for_o2o = hard_label_for_o2o
         # Conv1x1 layer to map Student neck features to Teacher neck features channel-wise
         self.proj_layers = nn.ModuleList([
             nn.Conv2d(s_ch, t_ch, kernel_size=1, bias=False)
@@ -79,11 +82,11 @@ class YOLO26DistillationLoss(nn.Module):
             # . Dùng QuantityFocalLoss ko mask input(pred : raw, target : sigmoided)
             t_soft_targets = torch.sigmoid(t_scores)
             
-            loss_cls_elementwise = quantityFocalLoss(
+            loss_cls = quantityFocalLoss(
                 s_scores ,
                 t_soft_targets,
+                hard_label = self.hard_label_for_o2o and (branch == 'one2one')
             )
-            loss_cls = (loss_cls_elementwise) * (self.tau ** 2)
             if branch == 'one2one':
                 loss_cls_one = loss_cls
             else:

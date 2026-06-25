@@ -159,7 +159,8 @@ def main():
                         help="Student pretrain weight path")
     parser.add_argument("--save-path",   type=str,
                         default="yolo26n_person_distilled.pt")
-    parser.add_argument("--input-cache", action="store_true", help=" active image caching")
+    parser.add_argument("--input-cache", action="store_true", help=" activate image caching")
+    parser.add_argument("--hard-label", action="store_true", help=" activate hard label for o2o branch")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -240,8 +241,11 @@ def main():
         student_channels = (64, 128, 256),
         teacher_channels = (256, 512, 512),
         tau = 1.5,
+        hard_label_for_o2o= args.hard_label
     ).to(device)
-
+    if args.hard_label:
+        print("Activate Hard_label for o2o !!!!!!!")
+    
     trainable = filter(lambda p: p.requires_grad, student.parameters())
     optimizer  = optim.AdamW(
         list(trainable) + list(distill_loss.parameters()),
