@@ -2,6 +2,25 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class QuantityFocalLoss(nn.Module):
+    def __init__(self, beta = 0.25):
+        self.beta = beta
+    
+    def forward(self, pred : torch.Tensor, target : torch.Tensor, reduction : str = "yes"):
+        """
+            pred : [B, nc, H, W] raw
+            target : [B, nc, H, W] (non-raw)
+
+            formula : |p - y|^beta * BCE(p, y)
+        """
+
+        p = F.sigmoid(pred)
+        bce_loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
+        if reduction == 'none':
+            return (torch.abs(p-target) ** self.beta * bce_loss)
+        else:
+            return (torch.abs(p-target) ** self.beta * bce_loss).mean()
+
 class YOLO26DistillationLoss(nn.Module):
     def __init__(self, student_channels=(64, 128, 256), teacher_channels=(256, 512, 512), tau=2.0):
         super().__init__()
@@ -28,11 +47,14 @@ class YOLO26DistillationLoss(nn.Module):
             loss_feat += F.mse_loss(proj_s_feat, t_feat)
             
         # Khởi tạo các biến chứa giá trị Loss dạng scalar tensor
-        loss_cls = 0.0
+        loss_cls_one = torch.tensor(0.0, device=student_neck_feats[0].device)
+        loss_cls_many = torch.tensor(0.0, device=student_neck_feats[0].device)
         loss_bbox_many = torch.tensor(0.0, device=student_neck_feats[0].device)
         loss_bbox_one = torch.tensor(0.0, device=student_neck_feats[0].device)
         
-        gt_thresh = 0.3  # Ngưỡng lọc nền
+        gt_thresh = 0.25  # Ngưỡng lọc nền
+
+        quantityFocalLoss = QuantityFocalLoss(beta = 2)
 
         # Chạy vòng lặp tính toán song song cho cả 2 chiến lược gán nhãn
         for branch in ["one2many", "one2one"]:
@@ -47,17 +69,20 @@ class YOLO26DistillationLoss(nn.Module):
                 t_probs = torch.sigmoid(t_scores)
                 # Giữ lại .max(dim=1) như một lớp bảo vệ (safeguard) nếu sau này bạn đổi số class
                 max_prob, _ = t_probs.max(dim=1, keepdim=True)
-                mask = (max_prob > gt_thresh).float()  # Shape chuẩn: (B, 1, Anchors)
+                mask = (max_prob > gt_thresh).float()  # Shape chuẩn: (B, nc, anchors)
             
-            # . Classification Distillation Loss (Soft BCE) ko mask
-            t_soft_targets = torch.sigmoid(t_scores / self.tau)
+            # . Dùng QuantityFocalLoss ko mask input(pred : raw, target : sigmoided)
+            t_soft_targets = torch.sigmoid(t_scores)
             
-            loss_cls_elementwise = F.binary_cross_entropy_with_logits(
-                s_scores / self.tau,
+            loss_cls_elementwise = quantityFocalLoss(
+                s_scores ,
                 t_soft_targets,
-                reduction='none'
             )
-            loss_cls += (loss_cls_elementwise).mean() * (self.tau ** 2)
+            loss_cls = (loss_cls_elementwise) * (self.tau ** 2)
+            if branch == 'one2one':
+                loss_cls_one = loss_cls
+            else:
+                loss_cls_many = loss_cls
             
             # . Bounding Box Distillation Loss 
 
@@ -75,7 +100,8 @@ class YOLO26DistillationLoss(nn.Module):
 
         return {
             "loss_feat": loss_feat,
-            "loss_cls": loss_cls,
+            "los_cls_one" : loss_cls_one,
+            "loss_cls_many" : loss_cls_many,
             "loss_bbox_many": loss_bbox_many,
             "loss_bbox_one": loss_bbox_one
         }
