@@ -13,7 +13,8 @@ class QuantityFocalLoss(nn.Module):
 
             formula : |p - y|^beta * BCE(p, y)
         """
-
+        super().__init__()
+        
         p = F.sigmoid(pred)
         bce_loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
         if reduction == 'none':
