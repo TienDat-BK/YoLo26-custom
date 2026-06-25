@@ -190,6 +190,9 @@ def main():
         shuffle     = True,
         num_workers = 2,
         pin_memory  = (device.type == "cuda"),
+        persistent_workers=True,      # Giữ nguyên các worker qua các Epoch
+        prefetch_factor=2,
+        drop_last=True,
     )
 
     # ------------------------------------------------------------------
