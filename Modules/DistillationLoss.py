@@ -3,10 +3,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class QuantityFocalLoss(nn.Module):
-    def __init__(self, beta = 0.25, threshold = 0.25):
+    def __init__(self, beta = 2, threshold = 0.25, gamma = 2.0, alpha = 0.25):
         super().__init__()
         self.beta = beta
         self.threshold = threshold
+        self.gamma = gamma
+        self.alpha = alpha
         
     def forward(self, pred : torch.Tensor, target : torch.Tensor, reduction : str = "yes", hard_label : bool = False):
         """
@@ -17,17 +19,28 @@ class QuantityFocalLoss(nn.Module):
             hardlabel -> filter anchor which > threshold
         """
         if hard_label:
-            target = (target > self.threshold).float()
-
-        p = F.sigmoid(pred)
-        bce_loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
-        if reduction == 'none':
-            return (torch.abs(p-target) ** self.beta * bce_loss)
+            # Dùng Focal Loss chuẩn: alpha * (1 - p)^gamma * BCE(pred, hard_target)
+            hard_target = (target > self.threshold).float()
+            p = torch.sigmoid(pred)
+            bce_loss = F.binary_cross_entropy_with_logits(pred, hard_target, reduction='none')
+            focal_weight = self.alpha * (1 - p) ** self.gamma
+            if reduction == 'none':
+                return focal_weight * bce_loss
+            else:
+                with torch.no_grad():
+                    num_obj = hard_target.sum().clamp(min=1.0)
+                return (focal_weight * bce_loss).sum() / num_obj
         else:
-            # mask lấy các ô > threshold
-            with torch.no_grad():
-                num_obj = (target > self.threshold).sum()
-            return ((torch.abs(p-target) ** self.beta * bce_loss) / num_obj).sum()
+            # Dùng QuantityFocalLoss: |p - y|^beta * BCE(pred, soft_target)
+            p = torch.sigmoid(pred)
+            bce_loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
+            if reduction == 'none':
+                return torch.abs(p - target) ** self.beta * bce_loss
+            else:
+                # mask lấy các ô > threshold
+                with torch.no_grad():
+                    num_obj = (target > self.threshold).sum().clamp(min=1.0)
+                return (torch.abs(p - target) ** self.beta * bce_loss).sum() / num_obj
 
 class YOLO26DistillationLoss(nn.Module, ):
     def __init__(self, student_channels=(64, 128, 256), teacher_channels=(256, 512, 512), tau=2.0, hard_label_for_o2o : bool = True):
@@ -39,6 +52,7 @@ class YOLO26DistillationLoss(nn.Module, ):
             nn.Conv2d(s_ch, t_ch, kernel_size=1, bias=False)
             for s_ch, t_ch in zip(student_channels, teacher_channels)
         ])
+        self.quantityFocalLoss = QuantityFocalLoss()
 
     def forward(self, student_outputs, teacher_outputs, student_neck_feats, teacher_neck_feats):
         """
@@ -62,7 +76,7 @@ class YOLO26DistillationLoss(nn.Module, ):
         
         gt_thresh = 0.25  # Ngưỡng lọc nền
 
-        quantityFocalLoss = QuantityFocalLoss(beta = 2)
+        
 
         # Chạy vòng lặp tính toán song song cho cả 2 chiến lược gán nhãn
         for branch in ["one2many", "one2one"]:
@@ -82,7 +96,7 @@ class YOLO26DistillationLoss(nn.Module, ):
             # . Dùng QuantityFocalLoss ko mask input(pred : raw, target : sigmoided)
             t_soft_targets = torch.sigmoid(t_scores)
             
-            loss_cls = quantityFocalLoss(
+            loss_cls = self.quantityFocalLoss(
                 s_scores ,
                 t_soft_targets,
                 hard_label = self.hard_label_for_o2o and (branch == 'one2one')
