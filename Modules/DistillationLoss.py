@@ -22,7 +22,8 @@ class QuantityFocalLoss(nn.Module):
             return (torch.abs(p-target) ** self.beta * bce_loss)
         else:
             # mask lấy các ô > threshold
-            num_obj = (target > self.threshold).sum()
+            with torch.no_grad():
+                num_obj = (target > self.threshold).sum()
             return (torch.abs(p-target) ** self.beta * bce_loss) / num_obj
 
 class YOLO26DistillationLoss(nn.Module):
