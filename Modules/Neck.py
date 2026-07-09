@@ -1,7 +1,7 @@
 import math
 import torch
 import torch.nn as nn
-from Modules.blocks import Conv, C3k2, SPPF
+from Modules.blocks import Conv, C3k2, SPPF, C2PSA
 
 def make_divisible(x, divisor=8):
     """Ensure channel dimensions are divisible by 8."""
@@ -23,6 +23,9 @@ class Neck(nn.Module):
         # --- Upsample / Top-down Path ---
         # SPPF (Block 9)
         self.sppf = SPPF(c5, c5, k=5, n=3, shortcut=True)
+
+        # C2PSA (Block 10)
+        self.c2psa = C2PSA(c5, c5, int(2 * d))
         
         # Upsample 11
         self.up11 = nn.Upsample(scale_factor=2, mode="nearest")
@@ -46,8 +49,8 @@ class Neck(nn.Module):
         # Conv 20
         self.conv20 = Conv(c4, c4, k=3, s=2)
         
-        # C3k2 (Block 22) - Note: attn=False as requested
-        self.c3k2_22 = C3k2(c4 + c5, c5, n=n_block_last, c3k=True)
+        # C3k2 (Block 22) - Note: attn=True
+        self.c3k2_22 = C3k2(c4 + c5, c5, n=n_block_last, attn=True)
 
     def forward(self, y: list[torch.Tensor]) -> list[torch.Tensor]:
         # y = [y1, y2, y3] from Backbone
@@ -58,6 +61,7 @@ class Neck(nn.Module):
         
         # 1. SPPF (9)
         feat_sppf = self.sppf(y3) # [B, c5, 20, 20]
+        feat_sppf = self.c2psa(feat_sppf)
         
         # 2. Top-down path
         up_sppf = self.up11(feat_sppf) # [B, c5, 40, 40]
